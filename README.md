@@ -39,6 +39,37 @@ Leveraging a multi-role distributed architecture with Ray for flexible resource 
 
 ---
 
+## About this fork: ROLL4ZenGen
+
+This repository is ROLL with training support for two models merged in, kept here because the
+corresponding upstream pull requests are still open. Everything else is upstream ROLL, and the
+full commit history of all three lines is preserved.
+
+| Merged in | Upstream PR | Commit |
+|---|---|---|
+| ROLL v0.4.0 and two later fixes | upstream `main` | `d96d0cc` |
+| Qwen3.6-27B hybrid attention training | [alibaba/ROLL#497](https://github.com/alibaba/ROLL/pull/497) | `bd6335b` |
+| Qwen3.8-Flash-Next training | [alibaba/ROLL#502](https://github.com/alibaba/ROLL/pull/502) | `4725516` |
+
+What the two model lines add: a Qwen3.8-Flash-Next model adapter preserving GR residual streams,
+the PLE external N-gram table, QSA attention and hybrid GDN layers across training, checkpointing
+and rollout; frozen-table backbone training with CPU optimizer offload; LoRA SFT, RL and
+on-policy distillation; save and resume; and the Qwen3.5 hybrid attention fix with a torch GDN
+fallback. For the Flash-Next line, Megatron roles reject packed sequences, so configs set
+`use_sequence_packing: false`.
+
+Validation status: the merged tree has been exercised on 8 x H800 for LoRA SFT, bit-exact cold
+resume, GRPO, LoRA on-policy distillation and full-backbone RL, each for 20 optimizer updates
+where applicable. These runs show lifecycle behaviour, not convergence or numerical acceptance.
+A full 20-update full-backbone distillation pass and full-model native probability parity are
+still open. See the upstream PR descriptions for the detailed evidence.
+
+Licensing is unchanged from upstream ROLL (Apache 2.0). Issues specific to these two model lines
+belong here; everything else belongs upstream at
+[alibaba/ROLL](https://github.com/alibaba/ROLL).
+
+---
+
 ## 📢 News
 
 | 📣   Updates                                                                                                                                                                                                                                                                                                                                                        |

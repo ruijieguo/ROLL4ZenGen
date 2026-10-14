@@ -4,7 +4,7 @@
 
 ## 1. 目标与当前边界
 
-用户要求研究模型架构、改进 ROLL 及依赖，在 172.16.120.181 上使用 `/data_hdd/Qwen3.8-Flash-Next` 充分验证高效 SFT/RL。前一项 27B 修复已有独立 PR #497，本项另开开发分支，不能把其结果记作 Flash-Next 验证。
+用户要求研究模型架构、改进 ROLL 及依赖，在验证主机上使用 `/data_hdd/Qwen3.8-Flash-Next` 充分验证高效 SFT/RL。前一项 27B 修复已有独立 PR #497，本项另开开发分支，不能把其结果记作 Flash-Next 验证。
 
 第一交付面是文本 SFT 和 GRPO/RLVR；保留原始 vision/MTP 权重及配置，导出时明确其未训练，默认不启用 MTP speculative decoding。视觉后训练、MTP 联合训练和分布式 CP 不在第一验收面内，不能宣传为已支持。不是将模型改名为 Qwen3-Next 或 Qwen3.5，也不是忽略加载失败的张量。
 
@@ -351,7 +351,7 @@ Current release gates: real LoRA100updates at an8K maximum and exact checkpoint5
 
 The real v2 ROLL RL run passed source/data preflight, started the eight-GPU Ray cluster and created actor/inference/reward workers. It then failed during vLLM EngineCore KV-cache initialization with `ValueError: CSA+linear layer 3 cache specs violate CSA geometry`; no `advantages`, `model_update_start`, or `model_update_return` event was recorded. The preceding Ray RPC failure is therefore repaired and independently covered by 23 passing tests, but full RL remains unverified. Native vLLM LoRA probe still passes with max_model_len=512/max_num_seqs=1. ROLL v2 used max_model_len=1536/max_num_seqs=8. The archived vLLM docs identify CSA per-state compression and cache block alignment as the enforced constraint; no production tolerance was changed.
 
-A low-cost v3 boundary configuration is prepared locally: prompt_length=256, response_length=128, inference max_model_len/max_num_batched_tokens=512 and max_num_seqs=1, with separate launcher ports/output. It is not uploaded or run because SSH to 172.16.120.181 has repeatedly been closed after connection establishment. No overlapping GPU task is assumed; the last observed v2 driver/engine had exited, but a fresh inventory is pending remote access recovery. Files: output/rl-validation-data/rlvr-lora-smoke-v3.yaml and run_rl_smoke_v3.sh.
+A low-cost v3 boundary configuration is prepared locally: prompt_length=256, response_length=128, inference max_model_len/max_num_batched_tokens=512 and max_num_seqs=1, with separate launcher ports/output. It is not uploaded or run because SSH to the validation host has repeatedly been closed after connection establishment. No overlapping GPU task is assumed; the last observed v2 driver/engine had exited, but a fresh inventory is pending remote access recovery. Files: output/rl-validation-data/rlvr-lora-smoke-v3.yaml and run_rl_smoke_v3.sh.
 
 
 ### 2026-09-14 19:40 UTC: CSA root cause fixed; real RL v6 active
