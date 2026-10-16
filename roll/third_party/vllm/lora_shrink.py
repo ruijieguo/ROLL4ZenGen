@@ -4,8 +4,8 @@ import importlib
 import sys
 from functools import wraps
 
+from roll.models.qwen4_exp_scope import FLASH_NEXT_MODEL_TYPES as _MODEL_TYPES
 
-_MODEL_TYPES = {"qwen4_exp", "qwen4_exp_text", "qwen3_8_flash_next", "qwen3_8_flash_next_text"}
 _SHRINK_MODULE = "vllm.lora.ops.triton_ops.lora_shrink_op"
 
 
