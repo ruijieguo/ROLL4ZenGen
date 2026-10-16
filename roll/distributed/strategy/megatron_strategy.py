@@ -62,6 +62,7 @@ from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import default_processor_provider, default_tokenizer_provider, freeze_except_mtp
 from roll.platforms import current_platform
 from roll.third_party.megatron.compile_warmup import compile_warmup_pipeline_stages
+from roll.third_party.megatron.gdn_lora_checkpoint import install_for_model_type as install_gdn_lora_checkpoint
 from roll.third_party.megatron.model_update import MegatronWeightUpdater
 from roll.third_party.megatron.mtp_patcher import patch_mtp_functions
 from roll.third_party.megatron.offload_states_patch import (
@@ -1448,6 +1449,13 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             from roll.third_party.megatron.grad_sync_memory import FirstGradSyncCacheRelease
 
             self.model.config.finalize_model_grads_func = FirstGradSyncCacheRelease(finalize_model_grads)
+
+        # Megatron's GDN checkpoint path looks up one fixed input-projection key
+        # and raises KeyError once LoRA renames it (upstream ROLL issue #411).
+        # Scoped to this model type so other GDN models keep Megatron's own
+        # implementation. Installed after the model exists but before any
+        # checkpoint is written.
+        install_gdn_lora_checkpoint(getattr(self.model.config, "hf_model_type", None))
 
         # Inject mtp_training_mode from WorkerConfig to model config
         if hasattr(self.worker_config, "mtp_training_mode"):

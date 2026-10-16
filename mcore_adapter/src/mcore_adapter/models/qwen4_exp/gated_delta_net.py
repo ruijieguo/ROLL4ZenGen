@@ -9,13 +9,27 @@ from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 
 
 class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
-    def __init__(self, *args, **kwargs):
-        if not hasattr(GatedDeltaNet, "_apply_causal_conv1d"):
-            raise RuntimeError(
-                "Qwen3.8 requires the Megatron GDN convolution hook; "
-                "apply scripts/qwen38/patch_megatron_gdn_convolution.py"
-            )
-        super().__init__(*args, **kwargs)
+    def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
+        """Keep the decay exponential and the write gate in FP32.
+
+        Two distinct quantities, both rounded too early upstream.
+
+        ``g`` is the log-domain decay. Megatron already evaluates the softplus
+        term in FP32 but exponentiates ``A_log`` in the parameter dtype, so a
+        BF16 checkpoint rounds the decay base before the multiply. The
+        recurrence applies ``g`` once per step, so that error compounds along
+        the sequence instead of staying in the last bit.
+
+        ``beta`` is the write strength handed to the delta rule. Upstream calls
+        ``sigmoid`` in the input dtype; promoting first stops the saturating
+        ends of the curve from collapsing onto one BF16 value.
+
+        Replaces scripts/qwen38/patch_megatron_gdn_{decay,gate_precision}.py.
+        The parent carries ``@jit_fuser``; overriding gives up that fusion for
+        these few elementwise ops, which is the cost of the added precision.
+        """
+        g = -A_log_local_cp.float().exp() * F.softplus(alpha.float() + dt_bias_local_cp)
+        return g, beta.float().sigmoid()
 
     @staticmethod
     def _split_input_projection(module, hidden_states, qkvz_rows):
@@ -142,9 +156,14 @@ class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
             module.forward = original
 
     def forward(self, *args, **kwargs):
-        # Keep Megatron's tested convolution, CP and recurrence implementation;
-        # retain projection precision across the TP communication boundary.
-        with self._native_input_projection(), self._fp32_output_projection():
+        # Keep Megatron's tested CP and recurrence implementation; retain
+        # projection precision across the TP communication boundary and the
+        # native rounding of the causal convolution.
+        with (
+            self._native_input_projection(),
+            self._fp32_output_projection(),
+            self._native_causal_convolution(),
+        ):
             return super().forward(*args, **kwargs)
 
     @contextmanager
@@ -192,11 +211,60 @@ class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
         finally:
             base.forward = original
 
-    def _apply_causal_conv1d(self, x, weight, bias):
-        """Match native product rounding across the complete causal window."""
-        from .causal_convolution import causal_conv1d
+    @contextmanager
+    def _native_causal_convolution(self):
+        """Swap FLA's ``causal_conv1d`` for the native-rounding one.
 
-        return causal_conv1d(x, weight.squeeze(1), bias)
+        Megatron calls the FLA kernel through its own module namespace, so
+        rebinding that attribute for the duration of this forward replaces the
+        implementation without a source patch. Replaces
+        scripts/qwen38/patch_megatron_gdn_convolution.py, which inserted an
+        ``_apply_causal_conv1d`` hook into the dependency instead.
+
+        Only the non-deterministic branch routes here. ``deterministic_mode``
+        uses ``F.conv1d`` directly, and that path is left alone.
+        """
+        from megatron.core.ssm import gated_delta_net as megatron_gdn
+
+        from .causal_convolution import causal_conv1d as native_causal_conv1d
+
+        original = getattr(megatron_gdn, "causal_conv1d", None)
+        if original is None:
+            # FLA missing entirely: upstream asserts on this before reaching the
+            # call, so do not mask it with a silent substitution.
+            yield
+            return
+
+        def shim(
+            x,
+            weight,
+            bias=None,
+            activation=None,
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=None,
+            **kwargs,
+        ):
+            if initial_state is not None or output_final_state:
+                raise NotImplementedError(
+                    "Qwen4 native causal convolution does not carry conv state; "
+                    "Megatron requested recurrent-cache behaviour"
+                )
+            if activation not in ("silu", "swish"):
+                raise ValueError(f"Qwen4 native causal convolution expects silu/swish, got {activation!r}")
+            if cu_seqlens is not None:
+                # Variable-length packing would make the causal window span
+                # sequence boundaries. Flash-Next Megatron roles already reject
+                # packed sequences (use_sequence_packing=false), so this is
+                # unreachable rather than merely unsupported.
+                raise NotImplementedError("Qwen4 native causal convolution does not support packed cu_seqlens")
+            return native_causal_conv1d(x, weight, bias), None
+
+        megatron_gdn.causal_conv1d = shim
+        try:
+            yield
+        finally:
+            megatron_gdn.causal_conv1d = original
 
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Round after normalization, affine scaling and the output gate.
