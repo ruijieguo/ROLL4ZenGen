@@ -1,4 +1,6 @@
+from contextlib import contextmanager
 from typing import Optional
+
 import torch
 
 from ..auto.modeling_auto import register_model
@@ -35,9 +37,41 @@ class Qwen4ExpModel(McaGPTModel):
     bounded_rl_token_statistics_capability = "qwen4_exp_v1"
 
     def __init__(self, config, **kwargs):
-        super().__init__(config, **kwargs)
+        # Megatron's GPTModel hard-codes ``TransformerBlock`` when it builds the
+        # decoder, and the PLE n-gram tables need the original token ids to
+        # reach the layers through activation recomputation, which that block
+        # does not forward. Rebinding the name in Megatron's own module for the
+        # duration of this constructor substitutes the subclass without a source
+        # patch, and only for this model.
+        with self._qwen4_decoder_class():
+            super().__init__(config, **kwargs)
         if not isinstance(self.decoder, Qwen4ExpTransformerBlock):
-            raise RuntimeError("Megatron GPTModel needs the Qwen4 decoder factory patch; run scripts/qwen38/patch_megatron_block_factory.py on the isolated dependency checkout")
+            raise RuntimeError(
+                "Megatron GPTModel did not use the Qwen4 decoder: expected "
+                f"Qwen4ExpTransformerBlock, got {type(self.decoder).__name__}. "
+                "GPTModel's decoder construction changed; revisit "
+                "Qwen4ExpModel._qwen4_decoder_class."
+            )
+
+    @staticmethod
+    @contextmanager
+    def _qwen4_decoder_class():
+        """Point Megatron's ``TransformerBlock`` name at the Qwen4 subclass.
+
+        Replaces scripts/qwen38/patch_megatron_block_factory.py, which edited
+        ``gpt_model.py`` to read a ``transformer_block_class`` attribute.
+
+        Restores the original binding even if construction raises, so a failed
+        build cannot leave the dependency pointing at this model's decoder.
+        """
+        from megatron.core.models.gpt import gpt_model as megatron_gpt_model
+
+        original = megatron_gpt_model.TransformerBlock
+        megatron_gpt_model.TransformerBlock = Qwen4ExpTransformerBlock
+        try:
+            yield
+        finally:
+            megatron_gpt_model.TransformerBlock = original
 
     def forward(self, input_ids, position_ids, attention_mask, *args,
                 extra_block_kwargs=None, padding_mask=None, loss_mask=None, **kwargs):
