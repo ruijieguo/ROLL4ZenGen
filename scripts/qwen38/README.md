@@ -376,6 +376,29 @@ The SFT validation runner requires at least one complete heldout batch before
 initializing workers: `DP * gradient_accumulation_steps * infer_batch_size`
 records. With the supplied TP1/EP8 LoRA configuration, use at least eight
 heldout records. A second check rejects an empty loader after preprocessing.
+`SFTPipeline` now applies the same check itself, so the hydra entry
+(`examples/start_sft_pipeline.py`) fails early instead of crashing on an empty
+`val_loss` list in `run()`. Scale the heldout set with the data-parallel size:
+TP4 on 40 GPUs is DP10 and needs at least 40 records with
+`gradient_accumulation_steps=4`, `infer_batch_size=1`.
+
+## Multi-node notes
+
+- Do not set `NCCL_BUFFSIZE` (or `NCCL_MAX_CTAS`) in `system_envs` for multi-node
+  runs. The 1 MiB buffer that used to ship in the `configs/*.yaml` templates was
+  validated only on a single 8-GPU host. Across nodes it makes the first
+  data-parallel reduce-scatter of full-parameter training never complete: step 0
+  hangs and the NCCL watchdog fires after 30 minutes on
+  `DATA_PARALLEL_GROUP_WITH_CP`. LoRA runs hid the problem because their
+  gradient buckets are a few tens of MB. Removing the two variables was
+  sufficient; 2/4/5-node full-parameter SFT (TP4/EP8, CPU Adam) then trains and
+  saves normally with roughly the same per-step time as a single node.
+- Thinking-trace SFT data (`<think>...</think>` in the response) must be split
+  into `reasoning_content` + `content` for thinking-enabled templates such as
+  `qwen3`; `get_encode_function` does this via `_assistant_turn`. Without it the
+  supervised target is an empty think block followed by the trace inside the
+  answer. `tests/pipeline/test_thinking_sft_target.py` covers both the split and
+  (with `QWEN38_TOKENIZER_PATH`) the rendered target.
 
 ## Native DCP payload validation
 

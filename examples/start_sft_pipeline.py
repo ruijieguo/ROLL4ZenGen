@@ -18,7 +18,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config_path", help="The path of the main configuration file", default="config")
     parser.add_argument(
-        "--config_name", help="The name of the main configuration file (without extension).", default="sppo_config"
+        "--config_name", help="The name of the main configuration file (without extension).", default="sft_config"
     )
     args = parser.parse_args()
 

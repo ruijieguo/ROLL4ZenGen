@@ -31,9 +31,10 @@ system_envs:
   CUDA_DEVICE_MAX_CONNECTIONS: '1'
   PYTORCH_CUDA_ALLOC_CONF: 'expandable_segments:True'
   OMP_NUM_THREADS: '2'
-  # Validated collective configuration for the eight-H800 acceptance host.
-  NCCL_BUFFSIZE: '1048576'
-  NCCL_MAX_CTAS: '8'
+  # NCCL_BUFFSIZE / NCCL_MAX_CTAS were removed (2026-10-18). The 1 MiB buffer was validated
+  # only on a single 8-GPU host; across nodes it makes the first data-parallel
+  # reduce-scatter of full-parameter training never complete (NCCL watchdog timeout at
+  # step 0). LoRA hid it because its gradients are tiny. Do not re-add for multi-node runs.
 
 validation:
   data_args:

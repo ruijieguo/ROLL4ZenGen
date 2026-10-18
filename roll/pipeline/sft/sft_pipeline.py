@@ -39,6 +39,25 @@ def preprocess_dataset(dataset, prompt_len, encode_func, num_proc):
     return dataset
 
 
+def _assistant_turn(response):
+    """Split a response that carries a thinking trace into reasoning_content + content.
+
+    Chat templates with thinking enabled (e.g. ``qwen3``) render the assistant turn as
+    ``<think>\n{reasoning_content}\n</think>\n\n{content}``. If the whole response is passed as
+    ``content``, the supervised target becomes an *empty* think block followed by the trace
+    inside the answer text. When the response contains ``</think>`` we split on its first
+    occurrence (dropping an optional leading ``<think>``); responses without a trace are
+    unchanged.
+    """
+    if "</think>" not in response:
+        return {"role": "assistant", "content": response}
+    think, answer = response.split("</think>", 1)
+    think = think.strip()
+    if think.startswith("<think>"):
+        think = think[len("<think>"):].strip()
+    return {"role": "assistant", "reasoning_content": think, "content": answer.strip()}
+
+
 def get_encode_function(template_name, tokenizer, prompt_key, query_key, response_key, system_key=None):
     chat_template_func = get_chat_template(template_name, tokenizer)
 
@@ -48,7 +67,7 @@ def get_encode_function(template_name, tokenizer, prompt_key, query_key, respons
             conversation.append({"role": "system", "content": system_prompt})
         conversation.append({"role": "user", "content": prompt + ("\n" + query if query else "")})
         if response:
-            conversation.append( {"role": "assistant", "content": response})
+            conversation.append(_assistant_turn(response))
         return conversation
 
     def encode_function(data_i):
@@ -217,6 +236,15 @@ class SFTPipeline(BasePipeline):
                 num_proc=self.pipeline_config.sft_train.data_args.preprocessing_num_workers)
 
             global_val_batch_size = dp_size * ga_steps * self.pipeline_config.sft_train.infer_batch_size
+            # drop_last=True below: fewer rows than one global batch yields an empty loader, an
+            # empty val_loss list and a confusing ``float() argument ... 'list'`` crash in run().
+            if len(self.val_dataset) < global_val_batch_size:
+                raise ValueError(
+                    f"validation set has {len(self.val_dataset)} rows but one validation batch needs "
+                    f"dp_size({dp_size}) * gradient_accumulation_steps({ga_steps}) * "
+                    f"infer_batch_size({self.pipeline_config.sft_train.infer_batch_size}) = "
+                    f"{global_val_batch_size} rows; add rows or lower infer_batch_size"
+                )
             self.val_dataloader = DataLoader(
                 dataset=self.val_dataset,
                 batch_size=global_val_batch_size,
