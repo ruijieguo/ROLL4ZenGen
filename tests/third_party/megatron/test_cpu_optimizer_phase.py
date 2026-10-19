@@ -1,5 +1,6 @@
 """Exercise ROLL phase transitions with the installed HybridDeviceOptimizer."""
 import copy
+import importlib.util
 import inspect
 import os
 from types import SimpleNamespace
@@ -42,7 +43,9 @@ def test_typed_arguments_reject_incompatible_bounded_staging(tmp_path, missing):
         TrainingArguments(output_dir=str(tmp_path), use_cpu=True, report_to=[], **kwargs)
 
 
-@pytest.mark.skipif(os.environ.get("RUN_CPU_OPTIMIZER_TESTS") != "1", reason="requires Megatron")
+@pytest.mark.skipif(
+    importlib.util.find_spec("megatron.core.optimizer") is None, reason="requires Megatron"
+)
 def test_bounded_staging_installs_its_own_dependency_patch(monkeypatch):
     """The flag installs ROLL's replacement instead of asking for a patch.
 
