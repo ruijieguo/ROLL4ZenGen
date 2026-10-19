@@ -59,16 +59,21 @@ def get_megatron_optimizer(
 
     bounded_hybrid_cls = None
     if validate_bounded_cpu_grad_staging(config):
-        patch_error = (
-            "bounded_cpu_grad_staging requires the Megatron dependency patch; run "
-            "scripts/qwen38/patch_megatron_cpu_grad_staging.py on the task Megatron checkout"
-        )
-        try:
-            from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
-        except ImportError as error:
-            raise RuntimeError(patch_error) from error
-        if "bounded_cpu_grad_staging" not in inspect.signature(HybridDeviceOptimizer).parameters:
-            raise RuntimeError(patch_error)
+        # Install ROLL's replacements on the installed Megatron instead of
+        # asking the user to patch their checkout: bounded CPU gradient
+        # staging, and the two Hybrid checkpoint-serialization fixes that go
+        # with it. Only reached when the config asks for bounded staging, so
+        # other models and runs never touch these classes.
+        from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+        from roll.third_party.megatron.checkpoint_optimizer_state import install_hybrid_checkpoint_patches
+        from roll.third_party.megatron.cpu_master_params import install_bounded_cpu_grad_staging
+
+        if not install_bounded_cpu_grad_staging() or not install_hybrid_checkpoint_patches():
+            raise RuntimeError(
+                "bounded_cpu_grad_staging is set, but ROLL's replacements could not be installed "
+                "on the installed Megatron"
+            )
         bounded_hybrid_cls = HybridDeviceOptimizer
 
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
