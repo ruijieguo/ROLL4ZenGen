@@ -63,6 +63,7 @@ from roll.models.model_providers import default_processor_provider, default_toke
 from roll.platforms import current_platform
 from roll.third_party.megatron.compile_warmup import compile_warmup_pipeline_stages
 from roll.third_party.megatron.gdn_lora_checkpoint import install_for_model_type as install_gdn_lora_checkpoint
+from roll.third_party.megatron.model_type_patches import install_for_model_type as install_model_type_patches
 from roll.third_party.megatron.model_update import MegatronWeightUpdater
 from roll.third_party.megatron.mtp_patcher import patch_mtp_functions
 from roll.third_party.megatron.offload_states_patch import (
@@ -1456,6 +1457,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         # implementation. Installed after the model exists but before any
         # checkpoint is written.
         install_gdn_lora_checkpoint(getattr(self.model.config, "hf_model_type", None))
+
+        # Megatron patches that reach into code Megatron owns rather than into a
+        # Qwen4 class: bounded gradient clipping, the MoE router cache, the
+        # checkpoint padding gaps, and the DDP buffer allocation order. Scoped
+        # to this model type so other models keep Megatron's own code. Installed
+        # here because the model type is known and DDP wrapping (which calls
+        # _ParamAndGradBuffer.__init__) happens below.
+        install_model_type_patches(getattr(self.model.config, "hf_model_type", None))
 
         # Inject mtp_training_mode from WorkerConfig to model config
         if hasattr(self.worker_config, "mtp_training_mode"):
