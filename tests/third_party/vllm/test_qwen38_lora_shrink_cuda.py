@@ -14,8 +14,11 @@ def test_dense_lora_is_repeatable_and_matches_fp32_reference(monkeypatch, count,
     from roll.third_party.vllm.lora_shrink import patch_qwen38_lora_shrink
 
     module = importlib.import_module("vllm.lora.ops.triton_ops.lora_shrink_op")
+    # vLLM 0.23.0 split these: the kernel stays in lora_shrink_op.py, while the
+    # configuration selector the patch wraps moved to the sibling utils.py.
+    config_module = importlib.import_module("vllm.lora.ops.triton_ops.utils")
     # Restore process-global native configuration after every case.
-    monkeypatch.setattr(module, "get_lora_op_configs", module.get_lora_op_configs)
+    monkeypatch.setattr(config_module, "get_lora_op_configs", config_module.get_lora_op_configs)
     patch_qwen38_lora_shrink(SimpleNamespace(model_type="qwen4_exp"), SimpleNamespace())
     torch.manual_seed(42)
     x = torch.randn(count, width, device="cuda", dtype=torch.bfloat16)
