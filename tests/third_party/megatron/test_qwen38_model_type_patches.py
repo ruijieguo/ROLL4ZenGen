@@ -173,3 +173,40 @@ def test_the_reproduced_buffer_defers_gradient_allocation():
     remap = source.index("Remap original weights")
     allocation = source.index("self.grad_data = torch.zeros(")
     assert remap < allocation
+
+
+def test_every_symbol_the_reproduced_bodies_import_exists():
+    """Resolve each import the reproduced bodies make against real Megatron.
+
+    The install tests monkeypatch the attributes they assert on, so they never
+    execute the reproduced bodies -- and a wrong module path inside one of them
+    (``is_mxfp8tensor`` is in ``megatron.core.fp8_utils``, not
+    ``megatron.core.utils``) stays invisible until the first training step. This
+    imports every name those bodies reference, at the path they use.
+    """
+    import importlib
+
+    required = {
+        "megatron.core.utils": ["to_local_if_dtensor", "log_on_each_pipeline_stage"],
+        "megatron.core.optimizer.clip_grads": ["multi_tensor_applier", "multi_tensor_scale_impl"],
+        "megatron.core.transformer.moe.moe_utils": ["unpermute"],
+        "megatron.core.dist_checkpointing.mapping": ["ShardedObject", "ShardedTensor"],
+        "megatron.core.dist_checkpointing.utils": ["LocalNonpersistentObject"],
+        "megatron.core.fp8_utils": ["is_float8tensor", "is_mxfp8tensor"],
+        "megatron.core.distributed.param_and_grad_buffer": [
+            "BufferType",
+            "nccl_allocator",
+            "modify_underlying_storage",
+        ],
+        "megatron.core": ["parallel_state"],
+    }
+    missing = []
+    for module_name, attributes in required.items():
+        module = importlib.import_module(module_name)
+        for attribute in attributes:
+            if not hasattr(module, attribute):
+                missing.append(f"{module_name}.{attribute}")
+    assert not missing, (
+        "the reproduced bodies in roll/third_party/megatron/model_type_patches.py import "
+        "names that the installed Megatron does not expose there: " + ", ".join(missing)
+    )
