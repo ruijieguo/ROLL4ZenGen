@@ -6,7 +6,7 @@ from functools import wraps
 
 from roll.models.qwen4_exp_scope import FLASH_NEXT_MODEL_TYPES as _MODEL_TYPES
 
-_SHRINK_MODULE = "vllm.lora.ops.triton_ops.lora_shrink_op"
+_SHRINK_MODULE = "vllm.lora.ops.triton_ops.utils"
 
 
 def patch_qwen38_lora_shrink(hf_config, lora_config):
