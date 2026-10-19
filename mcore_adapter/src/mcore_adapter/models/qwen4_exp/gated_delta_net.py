@@ -1,14 +1,104 @@
 """Qwen4 GDN keeps convolution activation separate from the output gate."""
 from __future__ import annotations
 
+import inspect
 from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 
+# Megatron's GatedDeltaNet.forward, in the two layouts this model supports. The
+# overrides below only act if forward still reaches these points; anything else
+# means the override is dead code and the numerical fix it carries is absent.
+#
+#   hook layout   megatron-core >= 0.18: forward calls self._compute_g_and_beta,
+#                 which this subclass replaces outright.
+#   inline layout megatron-core 0.16 with scripts/qwen38/patch_megatron_gdn_
+#                 {decay,gate_precision}.py applied: the FP32 forms sit in
+#                 forward itself, so the decay and write-gate override is
+#                 redundant rather than wrong. The convolution rebind still
+#                 applies, because the source patch's method calls the same
+#                 module-level name.
+HOOK_LAYOUT_CALL = "g, beta = self._compute_g_and_beta("
+INLINE_LAYOUT_DECAY = "A_log_local_cp.float().exp()"
+INLINE_LAYOUT_BETA = "beta.float().sigmoid()"
+MODULE_LEVEL_CONVOLUTION = "qkv, _ = causal_conv1d("
+PATCHED_CONVOLUTION = "qkv = self._apply_causal_conv1d("
+
+
+def verify_upstream_route() -> str:
+    """Fail unless the overrides below can take effect; report which layout.
+
+    ``_compute_g_and_beta`` and the causal-convolution rebind change nothing
+    merely by existing: the first runs only if Megatron's ``forward`` calls it,
+    the second only if ``forward`` reaches the convolution through the
+    module-level name it rebinds. Megatron 0.16 does neither -- it computes the
+    decay, the write gate and the convolution inline -- so on an unpatched 0.16
+    tree these overrides are dead code and the FP32 fixes vanish with no
+    symptom. That is the one failure this model cannot detect on its own, so it
+    is checked here, before training, by inspecting the source rather than by
+    comparing version numbers, so a backport or a refactor that keeps the
+    routing still passes.
+    """
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    try:
+        source = inspect.getsource(GatedDeltaNet.forward)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Cannot read the source of Megatron's GatedDeltaNet.forward "
+            f"({type(exc).__name__}: {exc}), so the Qwen4ExpGatedDeltaNet overrides "
+            "cannot be verified as reachable. Review this model against the installed "
+            "Megatron."
+        ) from exc
+
+    if hasattr(GatedDeltaNet, "_compute_g_and_beta"):
+        if HOOK_LAYOUT_CALL not in source:
+            raise RuntimeError(
+                "Megatron defines GatedDeltaNet._compute_g_and_beta but its forward never "
+                "calls it, so the Qwen4ExpGatedDeltaNet FP32 decay and write-gate override "
+                "would be silently skipped. Re-derive that override against the installed "
+                "Megatron."
+            )
+        layout = "hook"
+    else:
+        missing = [
+            name
+            for name, text in (
+                ("the FP32 decay exponential", INLINE_LAYOUT_DECAY),
+                ("the FP32 write gate", INLINE_LAYOUT_BETA),
+            )
+            if text not in source
+        ]
+        if missing:
+            raise RuntimeError(
+                "Megatron's GatedDeltaNet.forward does not define _compute_g_and_beta and "
+                "does not carry " + " or ".join(missing) + " inline, so this model would "
+                "train with BF16 decay and write-gate rounding and no fix in either the "
+                "override or the source. Install a Megatron that defines "
+                "_compute_g_and_beta, or apply scripts/qwen38/patch_megatron_gdn_decay.py "
+                "and patch_megatron_gdn_gate_precision.py to the dependency."
+            )
+        layout = "inline"
+
+    if MODULE_LEVEL_CONVOLUTION not in source and PATCHED_CONVOLUTION not in source:
+        raise RuntimeError(
+            "Megatron's GatedDeltaNet.forward does not reach a causal convolution this "
+            "model can intercept, so the native-rounding override would be silently "
+            "skipped. Re-derive it against the installed Megatron."
+        )
+    return layout
+
 
 class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
+    def __init__(self, *args, **kwargs):
+        # The overrides below act inside forward, so nothing at import time can
+        # tell whether they will be reached. Checked here, before any training,
+        # rather than silently running with unfixed numerics.
+        verify_upstream_route()
+        super().__init__(*args, **kwargs)
+
     def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):
         """Keep the decay exponential and the write gate in FP32.
 
