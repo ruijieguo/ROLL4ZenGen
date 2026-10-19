@@ -7,9 +7,16 @@ so the install/uninstall pair has to be exact -- a half-restored class would
 leak ROLL behaviour into other models, and a silently-skipped install would
 train with the unbounded gradient cache it was meant to replace.
 
-Runs against the installed megatron-core (skipped when absent). The methods
-under test are pure Python attribute swaps; no CUDA context is created.
+The assertions are deliberately *relative*: the validation image's Megatron
+already carries the legacy source patches, so several of these methods exist
+before install. What matters is that install swaps them and uninstall puts back
+exactly what was there -- not that any given attribute is absent.
+
+Runs against the installed megatron-core (skipped when absent). The attribute
+tests create no CUDA context; the constructor tests are skipped without a GPU.
 """
+
+import inspect
 
 import pytest
 
@@ -28,62 +35,93 @@ from roll.third_party.megatron.cpu_master_params import (  # noqa: E402
     uninstall_bounded_cpu_grad_staging,
 )
 
-_STAGING = (
+# Every method either installer replaces or adds.
+TOUCHED = (
     "__init__",
     "step",
     "_set_sub_optimizer_grads",
     "_prepare_bounded_cpu_grad_staging",
     "_stage_bounded_cpu_optimizer_grad",
+    "dummy_step",
+    "_register_load_state_dict_hooks",
+    "_sync_hdo_state_to_sub_optimizers",
 )
-_CHECKPOINT = ("dummy_step", "_register_load_state_dict_hooks", "_sync_hdo_state_to_sub_optimizers")
+_MARKERS = ("_qwen4_bounded_cpu_grad_staging_installed", "_qwen4_bounded_cpu_grad_staging_saved",
+            "_qwen4_hybrid_checkpoint_installed")
+_SET_MAIN = "_qwen4_unpatched_set_main_param_and_optimizer_states"
+
+
+def _snapshot():
+    """What the class looks like right now, for each method under test.
+
+    Records the class dict entry rather than the attribute, so an inherited
+    method (absent from the dict) is distinguished from one the class owns.
+    """
+    return {name: HybridDeviceOptimizer.__dict__.get(name) for name in TOUCHED}
+
+
+def _restore(snapshot):
+    for name, value in snapshot.items():
+        if value is None:
+            if name in HybridDeviceOptimizer.__dict__:
+                delattr(HybridDeviceOptimizer, name)
+        else:
+            setattr(HybridDeviceOptimizer, name, value)
 
 
 @pytest.fixture
 def clean():
-    """Both patches uninstalled before and after, in a fixed order."""
+    """Both patches uninstalled before and after, exactly as found."""
     uninstall_bounded_cpu_grad_staging()
     uninstall_hybrid_checkpoint_patches()
+    snapshot = _snapshot()
+    set_main = getattr(DistributedOptimizer, _SET_MAIN, None)
     yield
     uninstall_bounded_cpu_grad_staging()
     uninstall_hybrid_checkpoint_patches()
+    _restore(snapshot)
+    if set_main is not None:
+        setattr(DistributedOptimizer, _SET_MAIN, set_main)
 
 
-def test_import_leaves_the_dependency_untouched(clean):
-    """Importing the modules must not install anything by itself."""
-    assert not hasattr(HybridDeviceOptimizer, "_qwen4_bounded_cpu_grad_staging_installed")
-    assert not hasattr(HybridDeviceOptimizer, "_qwen4_hybrid_checkpoint_installed")
-    assert not hasattr(HybridDeviceOptimizer, "_prepare_bounded_cpu_grad_staging")
-    assert not hasattr(DistributedOptimizer, "_qwen4_unpatched_set_main_param_and_optimizer_states")
+def test_import_does_not_install_by_itself(clean):
+    """Importing the modules must not change the dependency."""
+    for marker in _MARKERS:
+        assert not hasattr(HybridDeviceOptimizer, marker)
 
 
 def test_install_replaces_every_method_it_claims_to(clean):
-    staging_before = {name: getattr(HybridDeviceOptimizer, name) for name in _STAGING}
-    checkpoint_before = {name: getattr(HybridDeviceOptimizer, name) for name in _CHECKPOINT}
+    """Each named method must actually be swapped, not silently skipped."""
+    before = {}
+    for name in TOUCHED:
+        entry = HybridDeviceOptimizer.__dict__.get(name)
+        before[name] = entry
     set_main_before = DistributedOptimizer._set_main_param_and_optimizer_states
 
     assert install_bounded_cpu_grad_staging()
     assert install_hybrid_checkpoint_patches()
 
-    for name, original in staging_before.items():
-        assert getattr(HybridDeviceOptimizer, name) is not original, f"{name} was not replaced"
-    for name, original in checkpoint_before.items():
-        assert getattr(HybridDeviceOptimizer, name) is not original, f"{name} was not replaced"
+    for name, previous in before.items():
+        assert HybridDeviceOptimizer.__dict__.get(name) is not previous, f"{name} was not replaced"
     assert DistributedOptimizer._set_main_param_and_optimizer_states is not set_main_before
 
 
 def test_install_is_idempotent(clean):
-    """A second call must not re-wrap, which would nest the originals."""
+    """A second call must not re-wrap, which would nest the previous install."""
     assert install_bounded_cpu_grad_staging()
-    installed = HybridDeviceOptimizer.__init__
-    original = getattr(HybridDeviceOptimizer, "_qwen4_unpatched_init")
+    first = HybridDeviceOptimizer.__dict__["__init__"]
     assert install_bounded_cpu_grad_staging()
-    assert HybridDeviceOptimizer.__init__ is installed
-    assert getattr(HybridDeviceOptimizer, "_qwen4_unpatched_init") is original
+    assert HybridDeviceOptimizer.__dict__["__init__"] is first
 
 
-def test_uninstall_restores_the_originals_exactly(clean):
-    staging_before = {name: getattr(HybridDeviceOptimizer, name) for name in _STAGING}
-    checkpoint_before = {name: getattr(HybridDeviceOptimizer, name) for name in _CHECKPOINT}
+def test_uninstall_restores_the_class_exactly(clean):
+    """Uninstall must put back the original entries, removals included.
+
+    The distinction that matters: a method the install *added* is removed
+    again, while one it merely *replaced* -- possibly because the dependency
+    already had it -- comes back as the same object.
+    """
+    before = _snapshot()
     set_main_before = DistributedOptimizer._set_main_param_and_optimizer_states
 
     install_bounded_cpu_grad_staging()
@@ -91,13 +129,14 @@ def test_uninstall_restores_the_originals_exactly(clean):
     assert uninstall_bounded_cpu_grad_staging()
     assert uninstall_hybrid_checkpoint_patches()
 
-    for name, original in {**staging_before, **checkpoint_before}.items():
-        assert getattr(HybridDeviceOptimizer, name) is original, f"{name} was not restored"
+    after = _snapshot()
+    assert after == before
     assert DistributedOptimizer._set_main_param_and_optimizer_states is set_main_before
-    # No marker attributes survive, so a later install starts from scratch.
-    assert not hasattr(HybridDeviceOptimizer, "_qwen4_bounded_cpu_grad_staging_installed")
-    assert not hasattr(HybridDeviceOptimizer, "_qwen4_hybrid_checkpoint_installed")
-    assert not hasattr(HybridDeviceOptimizer, "_prepare_bounded_cpu_grad_staging")
+    for marker in _MARKERS:
+        assert not hasattr(HybridDeviceOptimizer, marker)
+    # The saved-originals record must not survive, or a later install would
+    # restore this run's originals instead of its own.
+    assert "_qwen4_bounded_cpu_grad_staging_saved" not in vars(HybridDeviceOptimizer)
 
 
 def test_uninstall_without_install_is_a_noop(clean):
@@ -105,37 +144,47 @@ def test_uninstall_without_install_is_a_noop(clean):
     assert uninstall_hybrid_checkpoint_patches() is False
 
 
-def test_other_models_keep_the_native_optimizer(clean):
-    """Nothing is installed unless the flag path runs, so no other class is touched."""
-    other = type("PlainAdamW", (), {"__init__": object.__init__, "step": object.__init__})
-    before = other.__dict__.copy()
+def test_reinstall_after_uninstall_starts_clean(clean):
+    """The install must not depend on state left by a previous cycle."""
     install_bounded_cpu_grad_staging()
+    install_hybrid_checkpoint_patches()
+    uninstall_bounded_cpu_grad_staging()
+    uninstall_hybrid_checkpoint_patches()
+    before = _snapshot()
+    install_bounded_cpu_grad_staging()
+    install_hybrid_checkpoint_patches()
+    uninstall_bounded_cpu_grad_staging()
+    uninstall_hybrid_checkpoint_patches()
+    assert _snapshot() == before
+
+
+def test_no_other_class_is_touched(clean):
+    """Nothing is installed unless the flag path runs."""
+    other = type("PlainAdamW", (), {"__init__": object.__init__, "step": object.__init__})
+    before = dict(other.__dict__)
+    install_bounded_cpu_grad_staging()
+    install_hybrid_checkpoint_patches()
     assert other.__dict__ == before
-    assert "bounded_cpu_grad_staging" not in vars(other)
+    assert not hasattr(other, "bounded_cpu_grad_staging")
 
 
-def test_the_bounded_step_still_runs_megatrons_ordering(clean):
-    """Pin the four anchors the replacement reproduces.
+def test_the_bounded_step_reproduces_megatrons_ordering(clean):
+    """Pin the four anchors the replacement borrows.
 
-    The bounded step is a copy of Megatron's, so the anchors it borrows have to
-    keep existing; if one is renamed the copy silently diverges.
+    The bounded step is a copy of Megatron's, so if one of these is renamed the
+    copy diverges without any error.
     """
-    import inspect
-
     source = inspect.getsource(HybridDeviceOptimizer.step)
     for marker in ("_sync_hdo_param_groups_to_sub_optimizers", "self._d2h_stream",
                    "for cpu_optimizer in self.cpu_optimizers", "self._sync_sub_optimizers_state_to_hdo"):
         assert marker in source, marker
 
 
-def test_installer_verifies_the_upstream_contract(clean, monkeypatch):
+def test_staging_installer_verifies_the_upstream_contract(clean, monkeypatch):
     """A renamed anchor must fail the install, not silently diverge."""
     from roll.third_party.megatron import cpu_master_params
 
-    def broken_step(self, closure=None):
-        return None
-
-    monkeypatch.setattr(HybridDeviceOptimizer, "step", broken_step)
+    monkeypatch.setattr(HybridDeviceOptimizer, "step", lambda self, closure=None: None)
     with pytest.raises(RuntimeError, match="no longer contains"):
         cpu_master_params.install_bounded_cpu_grad_staging()
 
@@ -143,70 +192,75 @@ def test_installer_verifies_the_upstream_contract(clean, monkeypatch):
 def test_checkpoint_installer_verifies_the_upstream_contract(clean, monkeypatch):
     from roll.third_party.megatron import checkpoint_optimizer_state
 
-    def broken_dummy_step(self):
-        return None
-
-    monkeypatch.setattr(HybridDeviceOptimizer, "dummy_step", broken_dummy_step)
+    monkeypatch.setattr(HybridDeviceOptimizer, "dummy_step", lambda self: None)
     with pytest.raises(RuntimeError, match="randn"):
         checkpoint_optimizer_state.install_hybrid_checkpoint_patches()
 
 
+def test_installers_are_independent(clean):
+    """Uninstalling one must not disturb the other's methods."""
+    install_bounded_cpu_grad_staging()
+    staged = HybridDeviceOptimizer.__dict__["step"]
+    original_dummy = HybridDeviceOptimizer.__dict__.get("dummy_step")
+
+    install_hybrid_checkpoint_patches()
+    assert HybridDeviceOptimizer.__dict__["step"] is staged
+    assert uninstall_hybrid_checkpoint_patches()
+    # The staging install is still in place and functional.
+    assert HybridDeviceOptimizer.__dict__["step"] is staged
+    assert HybridDeviceOptimizer.__dict__.get("dummy_step") is original_dummy
+    assert uninstall_bounded_cpu_grad_staging()
+
+
 def test_the_installed_signature_accepts_the_flag(clean):
-    """The factory checks this signature, so the replacement must provide it."""
-    import inspect
-
+    """The optimizer factory reads this signature, so the replacement must provide it."""
     install_bounded_cpu_grad_staging()
-    assert "bounded_cpu_grad_staging" in inspect.signature(HybridDeviceOptimizer.__init__).parameters
-    assert (
-        inspect.signature(HybridDeviceOptimizer.__init__)
-        .parameters["bounded_cpu_grad_staging"]
-        .default
-        is False
-    )
+    parameters = inspect.signature(HybridDeviceOptimizer.__init__).parameters
+    assert "bounded_cpu_grad_staging" in parameters
+    assert parameters["bounded_cpu_grad_staging"].default is False
+    # Keyword-only, so a positional argument cannot collide with it.
+    assert parameters["bounded_cpu_grad_staging"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-def test_the_flag_is_not_forwarded_to_the_optimizer_defaults(clean):
-    """``bounded_cpu_grad_staging`` is a ROLL option, not a hyperparameter.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="constructing the Hybrid optimizer needs CUDA")
+class TestFlagPlumbing:
+    """The flag must reach the instance without becoming a hyperparameter.
 
-    Megatron's constructor passes ``**kwargs`` into ``defaults``; if the flag
-    leaked there, torch would reject the unknown key while adding param groups.
+    Separate from the attribute tests because Megatron's constructor opens CUDA
+    streams; this is the only part that needs a device.
     """
-    install_bounded_cpu_grad_staging()
-    parameters = torch.nn.ParameterList([torch.nn.Parameter(torch.ones(3))])
-    optimizer = HybridDeviceOptimizer(
-        [{"params": list(parameters)}],
-        offload_fraction=1.0,
-        cpu_optimizer_cls=torch.optim.AdamW,
-        gpu_optimizer_cls=torch.optim.AdamW,
-        overlap_cpu_optimizer_d2h_h2d=True,
-        bounded_cpu_grad_staging=True,
-    )
-    assert optimizer.bounded_cpu_grad_staging is True
-    assert "bounded_cpu_grad_staging" not in optimizer.defaults
 
-
-def test_the_flag_off_keeps_megatrons_own_constructor(clean):
-    install_bounded_cpu_grad_staging()
-    parameters = torch.nn.ParameterList([torch.nn.Parameter(torch.ones(3))])
-    optimizer = HybridDeviceOptimizer(
-        [{"params": list(parameters)}],
-        offload_fraction=1.0,
-        cpu_optimizer_cls=torch.optim.AdamW,
-        gpu_optimizer_cls=torch.optim.AdamW,
-        overlap_cpu_optimizer_d2h_h2d=True,
-    )
-    assert optimizer.bounded_cpu_grad_staging is False
-
-
-def test_the_flag_requires_overlapping_transfer(clean):
-    """The bounded buffer is only valid with one CPU optimizer per parameter."""
-    install_bounded_cpu_grad_staging()
-    with pytest.raises(ValueError, match="overlap_cpu_optimizer_d2h_h2d"):
-        HybridDeviceOptimizer(
-            [{"params": [torch.nn.Parameter(torch.ones(3))]}],
+    def _build(self, **overrides):
+        parameters = [torch.nn.Parameter(torch.ones(3, device="cuda"))]
+        kwargs = dict(
             offload_fraction=1.0,
             cpu_optimizer_cls=torch.optim.AdamW,
             gpu_optimizer_cls=torch.optim.AdamW,
-            overlap_cpu_optimizer_d2h_h2d=False,
-            bounded_cpu_grad_staging=True,
+            overlap_cpu_optimizer_d2h_h2d=True,
         )
+        kwargs.update(overrides)
+        return HybridDeviceOptimizer([{"params": parameters}], **kwargs)
+
+    def test_the_flag_reaches_the_instance(self, clean):
+        install_bounded_cpu_grad_staging()
+        assert self._build(bounded_cpu_grad_staging=True).bounded_cpu_grad_staging is True
+
+    def test_the_flag_defaults_off(self, clean):
+        install_bounded_cpu_grad_staging()
+        assert self._build().bounded_cpu_grad_staging is False
+
+    def test_the_flag_is_not_forwarded_to_the_optimizer_defaults(self, clean):
+        """Megatron passes **kwargs into ``defaults``; the flag must not leak.
+
+        torch rejects unknown keys when param groups are added, so a leak would
+        surface as a construction failure rather than a wrong value.
+        """
+        install_bounded_cpu_grad_staging()
+        optimizer = self._build(bounded_cpu_grad_staging=True)
+        assert "bounded_cpu_grad_staging" not in optimizer.defaults
+
+    def test_the_flag_requires_overlapping_transfer(self, clean):
+        """The single shared buffer is only valid with one CPU optimizer per parameter."""
+        install_bounded_cpu_grad_staging()
+        with pytest.raises(ValueError, match="overlap_cpu_optimizer_d2h_h2d"):
+            self._build(overlap_cpu_optimizer_d2h_h2d=False, bounded_cpu_grad_staging=True)

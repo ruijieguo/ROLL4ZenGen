@@ -190,10 +190,15 @@ class CpuMasterWeightProvider:
 # off, and the unbounded path delegates to Megatron's own implementation.
 
 _BOUNDED_INSTALLED = "_qwen4_bounded_cpu_grad_staging_installed"
-_ORIGINAL_INIT = "_qwen4_unpatched_init"
-_ORIGINAL_STEP = "_qwen4_unpatched_step"
-_ORIGINAL_SET_GRADS = "_qwen4_unpatched_set_sub_optimizer_grads"
+_BOUNDED_SAVED = "_qwen4_bounded_cpu_grad_staging_saved"
 _ORIGINAL_SET_MAIN_PARAM = "_qwen4_unpatched_set_main_param_and_optimizer_states"
+
+# The methods this module replaces or adds, by the name they live under on
+# HybridDeviceOptimizer. Installing records what was there under each name so
+# uninstall can put it back: a Megatron carrying the legacy source patches
+# already defines some of these, and deleting them would be wrong.
+_REPLACED = ("__init__", "step", "_set_sub_optimizer_grads")
+_ADDED = ("_prepare_bounded_cpu_grad_staging", "_stage_bounded_cpu_optimizer_grad")
 
 
 def _param_generator(optimizer):
@@ -206,6 +211,22 @@ def _hybrid_optimizer_class():
     from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
     return HybridDeviceOptimizer
+
+
+def _original(name):
+    """The method this module replaced, captured at install time.
+
+    Held in one record rather than a fixed attribute per method so uninstall
+    can put back exactly what was there, including methods a patched dependency
+    already provided.
+    """
+    saved = getattr(_hybrid_optimizer_class(), _BOUNDED_SAVED, None)
+    if saved is None or saved.get(name) is None:
+        raise RuntimeError(
+            f"bounded_cpu_grad_staging is not installed (no saved original for {name!r}); "
+            "install_bounded_cpu_grad_staging must run before any update step"
+        )
+    return saved[name]
 
 
 def _prepare_bounded_cpu_grad_staging(self):
@@ -288,7 +309,7 @@ def _bounded_step(self, closure=None):
 
 def _bounded_step_dispatch(self, closure=None):
     if not getattr(self, "bounded_cpu_grad_staging", False):
-        return getattr(type(self), _ORIGINAL_STEP)(self, closure)
+        return _original("step")(self, closure)
     return _bounded_step(self, closure)
 
 
@@ -299,7 +320,7 @@ def _bounded_init(self, *args, bounded_cpu_grad_staging=False, **kwargs):
     it is a ROLL option, not an optimizer hyperparameter, and torch rejects
     unknown keys when param groups are added.
     """
-    getattr(type(self), _ORIGINAL_INIT)(self, *args, **kwargs)
+    _original("__init__")(self, *args, **kwargs)
     self.bounded_cpu_grad_staging = bounded_cpu_grad_staging
     if bounded_cpu_grad_staging and not self.overlap_cpu_optimizer_d2h_h2d:
         raise ValueError('bounded_cpu_grad_staging requires overlap_cpu_optimizer_d2h_h2d=True')
@@ -313,7 +334,7 @@ def _bounded_set_sub_optimizer_grads(self):
     original is called with no CPU optimizers visible so that second loop does
     nothing, which keeps the FP32-alias half Megatron's own.
     """
-    original = getattr(type(self), _ORIGINAL_SET_GRADS)
+    original = _original("_set_sub_optimizer_grads")
     if not getattr(self, "bounded_cpu_grad_staging", False):
         return original(self)
     cpu_optimizers = self.cpu_optimizers
@@ -403,22 +424,23 @@ def install_bounded_cpu_grad_staging() -> bool:
     """Install the bounded-staging replacement on the installed Megatron.
 
     Idempotent. Called only when the ROLL config asks for bounded staging, so a
-    run without the flag never touches these classes.
+    run without the flag never touches these classes. Every attribute the
+    install touches is recorded beforehand, so uninstall restores exactly what
+    was there -- a dependency that already carries some of these methods (an
+    older Megatron with the legacy source patches) is put back, not stripped.
     """
     hybrid = _hybrid_optimizer_class()
     if getattr(hybrid, _BOUNDED_INSTALLED, False):
         return True
     _verify_bounded_contract()
 
-    setattr(hybrid, _ORIGINAL_INIT, hybrid.__init__)
-    setattr(hybrid, _ORIGINAL_STEP, hybrid.step)
-    setattr(hybrid, _ORIGINAL_SET_GRADS, hybrid._set_sub_optimizer_grads)
-
+    saved = {name: hybrid.__dict__.get(name) for name in _REPLACED + _ADDED}
     hybrid.__init__ = _bounded_init
     hybrid.step = _bounded_step_dispatch
     hybrid._set_sub_optimizer_grads = _bounded_set_sub_optimizer_grads
     hybrid._prepare_bounded_cpu_grad_staging = _prepare_bounded_cpu_grad_staging
     hybrid._stage_bounded_cpu_optimizer_grad = _stage_bounded_cpu_optimizer_grad
+    setattr(hybrid, _BOUNDED_SAVED, saved)
 
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
@@ -432,19 +454,18 @@ def install_bounded_cpu_grad_staging() -> bool:
 
 
 def uninstall_bounded_cpu_grad_staging() -> bool:
-    """Restore Megatron's own methods. For tests and scope assertions."""
+    """Restore exactly what was present before install. For scope tests."""
     hybrid = _hybrid_optimizer_class()
     if not getattr(hybrid, _BOUNDED_INSTALLED, False):
         return False
-    for name, original_name in (("__init__", _ORIGINAL_INIT), ("step", _ORIGINAL_STEP),
-                                ("_set_sub_optimizer_grads", _ORIGINAL_SET_GRADS)):
-        original = getattr(hybrid, original_name, None)
-        if original is not None:
-            setattr(hybrid, name, original)
-        delattr(hybrid, original_name)
-    for name in ("_prepare_bounded_cpu_grad_staging", "_stage_bounded_cpu_optimizer_grad"):
-        if name in vars(hybrid):
+    for name, previous in getattr(hybrid, _BOUNDED_SAVED, {}).items():
+        if previous is None:
+            # Absent before the install; drop the attribute rather than keep
+            # a method this module added.
             delattr(hybrid, name)
+        else:
+            setattr(hybrid, name, previous)
+    delattr(hybrid, _BOUNDED_SAVED)
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     original = getattr(DistributedOptimizer, _ORIGINAL_SET_MAIN_PARAM, None)

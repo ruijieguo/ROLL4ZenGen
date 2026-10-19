@@ -69,10 +69,22 @@ def prepare_cpu_adam_for_checkpoint(optimizer):
 # instead of requiring every user to patch their own Megatron checkout.
 
 _HYBRID_CHECKPOINT_INSTALLED = "_qwen4_hybrid_checkpoint_installed"
-_ORIGINAL_DUMMY_STEP = "_qwen4_unpatched_dummy_step"
-_ORIGINAL_LOAD_HOOKS = "_qwen4_unpatched_register_load_state_dict_hooks"
-_ORIGINAL_SYNC_HDO_STATE = "_qwen4_unpatched_sync_hdo_state_to_sub_optimizers"
+_HYBRID_CHECKPOINT_SAVED = "_qwen4_hybrid_checkpoint_saved"
 _ORIGINAL_GET_MAIN_PARAM = "_qwen4_unpatched_get_main_param_and_optimizer_states"
+
+# The methods this module replaces on HybridDeviceOptimizer.
+_REPLACED = ("dummy_step", "_register_load_state_dict_hooks", "_sync_hdo_state_to_sub_optimizers")
+
+
+def _original(name):
+    """The method this module replaced, captured at install time."""
+    hybrid = _hybrid_class()
+    saved = getattr(hybrid, _HYBRID_CHECKPOINT_SAVED, None)
+    if saved is None or saved.get(name) is None:
+        raise RuntimeError(
+            f"the Hybrid checkpoint patches are not installed (no saved original for {name!r})"
+        )
+    return saved[name]
 
 
 def _bounded_dummy_step(self):
@@ -84,7 +96,7 @@ def _bounded_dummy_step(self):
     nor a transient full CPU master copy.
     """
     if not getattr(self, "bounded_cpu_grad_staging", False):
-        return getattr(type(self), _ORIGINAL_DUMMY_STEP)(self)
+        return _original("dummy_step")(self)
     if self.state:
         return None
     self._sync_hdo_param_groups_to_sub_optimizers()
@@ -127,7 +139,7 @@ def _bounded_register_load_state_dict_hooks(self, *args, **kwargs):
     a second complete CPU master image; the ownership is asserted unchanged
     instead. The pre-hook is Megatron's, verbatim.
     """
-    original = getattr(type(self), _ORIGINAL_LOAD_HOOKS)
+    original = _original("_register_load_state_dict_hooks")
     if not getattr(self, "bounded_cpu_grad_staging", False):
         return original(self, *args, **kwargs)
 
@@ -164,7 +176,7 @@ def _bounded_register_load_state_dict_hooks(self, *args, **kwargs):
 
 def _bounded_sync_hdo_state_to_sub_optimizers(self):
     """Megatron's method plus the canonical master owner in the state entry."""
-    original = getattr(type(self), _ORIGINAL_SYNC_HDO_STATE)
+    original = _original("_sync_hdo_state_to_sub_optimizers")
     result = original(self)
     if getattr(self, "bounded_cpu_grad_staging", False) and self.param_update_in_fp32:
         # The loaded master has been copied into the actual optimizer
@@ -236,9 +248,8 @@ def install_hybrid_checkpoint_patches() -> bool:
         return True
     _verify_hybrid_checkpoint_contract()
 
-    setattr(hybrid, _ORIGINAL_DUMMY_STEP, hybrid.dummy_step)
-    setattr(hybrid, _ORIGINAL_LOAD_HOOKS, hybrid._register_load_state_dict_hooks)
-    setattr(hybrid, _ORIGINAL_SYNC_HDO_STATE, hybrid._sync_hdo_state_to_sub_optimizers)
+    setattr(hybrid, _HYBRID_CHECKPOINT_SAVED,
+            {name: hybrid.__dict__.get(name) for name in _REPLACED})
     hybrid.dummy_step = _bounded_dummy_step
     hybrid._register_load_state_dict_hooks = _bounded_register_load_state_dict_hooks
     hybrid._sync_hdo_state_to_sub_optimizers = _bounded_sync_hdo_state_to_sub_optimizers
@@ -257,15 +268,16 @@ def install_hybrid_checkpoint_patches() -> bool:
 
 
 def uninstall_hybrid_checkpoint_patches() -> bool:
-    """Restore Megatron's own methods. For tests and scope assertions."""
+    """Restore exactly what was present before install. For scope tests."""
     hybrid = _hybrid_class()
     if not getattr(hybrid, _HYBRID_CHECKPOINT_INSTALLED, False):
         return False
-    for name, original_name in (("dummy_step", _ORIGINAL_DUMMY_STEP),
-                                ("_register_load_state_dict_hooks", _ORIGINAL_LOAD_HOOKS),
-                                ("_sync_hdo_state_to_sub_optimizers", _ORIGINAL_SYNC_HDO_STATE)):
-        setattr(hybrid, name, getattr(hybrid, original_name))
-        delattr(hybrid, original_name)
+    for name, previous in getattr(hybrid, _HYBRID_CHECKPOINT_SAVED, {}).items():
+        if previous is None:
+            delattr(hybrid, name)
+        else:
+            setattr(hybrid, name, previous)
+    delattr(hybrid, _HYBRID_CHECKPOINT_SAVED)
     from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
     original = getattr(DistributedOptimizer, _ORIGINAL_GET_MAIN_PARAM, None)
