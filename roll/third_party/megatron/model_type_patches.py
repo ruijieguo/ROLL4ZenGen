@@ -279,8 +279,11 @@ def _param_and_grad_buffer_init(
 
     import torch
     from megatron.core import parallel_state
-    from megatron.core.distributed.param_and_grad_buffer import BufferType
-    from megatron.core.utils import is_float8tensor, is_mxfp8tensor
+    from megatron.core.distributed.param_and_grad_buffer import (
+        BufferType,
+        modify_underlying_storage,
+    )
+    from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
     from megatron.core.utils import log_on_each_pipeline_stage
 
     if pg_collection is None:
@@ -439,10 +442,6 @@ def _param_and_grad_buffer_init(
                     param.data.shape, param_start_index, buffer_type=BufferType.PARAM
                 )
                 if is_float8tensor(param):
-                    from megatron.core.distributed.param_and_grad_buffer import (
-                        modify_underlying_storage,
-                    )
-
                     modify_underlying_storage(param, new_param_data)
                 else:
                     old_param_data = param.data
