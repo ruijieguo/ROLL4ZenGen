@@ -43,19 +43,40 @@ def test_typed_arguments_reject_incompatible_bounded_staging(tmp_path, missing):
 
 
 @pytest.mark.skipif(os.environ.get("RUN_CPU_OPTIMIZER_TESTS") != "1", reason="requires Megatron")
-def test_bounded_staging_requires_dependency_patch_before_distributed_setup(monkeypatch):
+def test_bounded_staging_installs_its_own_dependency_patch(monkeypatch):
+    """The flag installs ROLL's replacement instead of asking for a patch.
+
+    The installed Megatron does not accept ``bounded_cpu_grad_staging`` itself;
+    ROLL adds it at runtime. This asserts the factory reaches that install path
+    rather than failing, and that the flag arrives on the constructed class.
+    """
     from megatron.core.optimizer import OptimizerConfig
     from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+    from roll.third_party.megatron import cpu_master_params
     from roll.third_party.megatron.optimizer import get_megatron_optimizer
 
-    signature = inspect.signature(HybridDeviceOptimizer.__init__)
-    signature = signature.replace(parameters=[p for p in signature.parameters.values()
-                                              if p.name != "bounded_cpu_grad_staging"])
-    monkeypatch.setattr(HybridDeviceOptimizer.__init__, "__signature__", signature, raising=False)
+    installed = []
+    original = cpu_master_params.install_bounded_cpu_grad_staging
+
+    def record():
+        installed.append(True)
+        return original()
+
+    # optimizer.py imports the name at call time, so patching the source module
+    # is what the factory resolves.
+    monkeypatch.setattr(cpu_master_params, "install_bounded_cpu_grad_staging", record)
     config = OptimizerConfig(optimizer_cpu_offload=True, overlap_cpu_optimizer_d2h_h2d=True)
     config.bounded_cpu_grad_staging = True
-    with pytest.raises(RuntimeError, match="patch_megatron_cpu_grad_staging"):
+    try:
         get_megatron_optimizer(config, [])
+    except Exception:
+        # A distributed-setup failure is expected with no initialized process
+        # group; the point is that the install ran instead of a "go patch your
+        # Megatron checkout" error being raised.
+        pass
+
+    assert installed, "the bounded-staging installer was never reached"
+    assert "bounded_cpu_grad_staging" in inspect.signature(HybridDeviceOptimizer.__init__).parameters
 
 
 @pytest.mark.skipif(os.environ.get("RUN_CPU_OPTIMIZER_TESTS") != "1", reason="requires Megatron and CUDA")

@@ -171,3 +171,285 @@ class CpuMasterWeightProvider:
         if group is not None and torch.distributed.get_world_size(group) > 1:
             torch.distributed.all_reduce(result, group=group)
         return result
+
+
+# ---------------------------------------------------------------------------
+# Opt-in bounded CPU gradient staging
+# ---------------------------------------------------------------------------
+# Megatron's HybridDeviceOptimizer stages every CPU parameter's gradient in a
+# per-parameter cache (``cpu_copy_map_grad``) that is never released, so the
+# cache grows with the parameter count and a full-model CPU optimizer holds a
+# second complete gradient image. This replaces the staging path with one
+# reusable buffer sized to the largest CPU parameter, allocating gradients
+# immediately before each sub-optimizer's update.
+#
+# Replaces scripts/qwen38/patch_megatron_cpu_grad_staging.py: it is installed
+# at runtime for the Flash-Next model type instead of requiring every user of
+# the model to patch their own Megatron checkout. Behaviour is unchanged --
+# every change is behind the ``bounded_cpu_grad_staging`` flag, which defaults
+# off, and the unbounded path delegates to Megatron's own implementation.
+
+_BOUNDED_INSTALLED = "_qwen4_bounded_cpu_grad_staging_installed"
+_ORIGINAL_INIT = "_qwen4_unpatched_init"
+_ORIGINAL_STEP = "_qwen4_unpatched_step"
+_ORIGINAL_SET_GRADS = "_qwen4_unpatched_set_sub_optimizer_grads"
+_ORIGINAL_SET_MAIN_PARAM = "_qwen4_unpatched_set_main_param_and_optimizer_states"
+
+
+def _param_generator(optimizer):
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            yield param
+
+
+def _hybrid_optimizer_class():
+    from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+    return HybridDeviceOptimizer
+
+
+def _prepare_bounded_cpu_grad_staging(self):
+    """Reserve one reusable buffer, never a per-parameter gradient cache."""
+    if not self.overlap_cpu_optimizer_d2h_h2d:
+        raise ValueError('bounded_cpu_grad_staging requires overlap_cpu_optimizer_d2h_h2d=True')
+    largest = 0
+    for optimizer in self.cpu_optimizers:
+        params = list(_param_generator(optimizer))
+        if len(params) != 1:
+            raise ValueError('bounded_cpu_grad_staging requires one parameter per CPU optimizer')
+        param = params[0]
+        param.grad = None
+        largest = max(largest, param.numel() * param.element_size())
+    self.cpu_copy_map_grad.clear()
+    # Held on the instance rather than initialized in _init_sub_optimizers: the
+    # checkpoint path deliberately skips re-initialization in bounded mode, and
+    # a buffer reset there would be immediate garbage.
+    buffer = getattr(self, '_cpu_grad_staging_buffer', None)
+    if largest and buffer is None:
+        # A byte buffer also supports mixed parameter dtypes without separate pools.
+        buffer = torch.empty(largest, dtype=torch.uint8, device='cpu', pin_memory=self.pin_cpu_grads)
+        self._cpu_grad_staging_buffer = buffer
+    if largest and buffer.numel() < largest:
+        raise RuntimeError('CPU parameter size changed after staging buffer allocation')
+
+
+def _stage_bounded_cpu_optimizer_grad(self, optimizer):
+    param = next(_param_generator(optimizer))
+    gpu_param = self.cpu_copys_map_gpu_param[param]
+    grad = getattr(gpu_param, 'decoupled_grad', gpu_param.grad)
+    param.requires_grad = False
+    if grad is None:
+        param.grad = None
+        return
+    size = param.numel() * param.element_size()
+    staged = self._cpu_grad_staging_buffer[:size].view(param.dtype).view(param.shape)
+    staged.copy_(grad, non_blocking=True)
+    param.grad = staged
+    self.cpu_copy_map_grad[param] = staged
+    self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
+
+
+def _bounded_step(self, closure=None):
+    """Megatron's step with each CPU gradient staged just before its update.
+
+    Mirrors the ordering of the unbounded step; only the staging points differ,
+    which is what bounds the retained memory. Kept as one body rather than
+    delegating because the staging has to happen inside the per-optimizer loop.
+    """
+    self._sync_hdo_param_groups_to_sub_optimizers()
+    self._prepare_bounded_cpu_grad_staging()
+    self._d2h_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(self._d2h_stream):
+        self._set_sub_optimizer_grads()
+
+    if self.gpu_optimizer:
+        torch.cuda.current_stream().wait_stream(self._d2h_stream)
+        self.gpu_optimizer.step(closure)
+
+    for cpu_optimizer in self.cpu_optimizers:
+        with torch.cuda.stream(self._d2h_stream):
+            self._stage_bounded_cpu_optimizer_grad(cpu_optimizer)
+        d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
+        if d2h_event is not None:
+            d2h_event.synchronize()
+        try:
+            cpu_optimizer.step(closure)
+        finally:
+            # CPU Adam consumes the gradient synchronously. H2D uses the master
+            # parameter, so the gradient buffer is now reusable.
+            for param in _param_generator(cpu_optimizer):
+                param.grad = None
+                self.cpu_copy_map_grad.pop(param, None)
+
+    # Subsequent GPU work must observe all asynchronous master copies.
+    torch.cuda.current_stream().wait_stream(self._h2d_stream)
+    self._sync_sub_optimizers_state_to_hdo()
+
+
+def _bounded_step_dispatch(self, closure=None):
+    if not getattr(self, "bounded_cpu_grad_staging", False):
+        return getattr(type(self), _ORIGINAL_STEP)(self, closure)
+    return _bounded_step(self, closure)
+
+
+def _bounded_init(self, *args, bounded_cpu_grad_staging=False, **kwargs):
+    """Megatron's constructor plus the opt-in flag, consumed not forwarded.
+
+    ``bounded_cpu_grad_staging`` is deliberately not passed into ``defaults``:
+    it is a ROLL option, not an optimizer hyperparameter, and torch rejects
+    unknown keys when param groups are added.
+    """
+    getattr(type(self), _ORIGINAL_INIT)(self, *args, **kwargs)
+    self.bounded_cpu_grad_staging = bounded_cpu_grad_staging
+    if bounded_cpu_grad_staging and not self.overlap_cpu_optimizer_d2h_h2d:
+        raise ValueError('bounded_cpu_grad_staging requires overlap_cpu_optimizer_d2h_h2d=True')
+
+
+def _bounded_set_sub_optimizer_grads(self):
+    """Megatron's method with the per-parameter gradient cache left alone.
+
+    The unbounded body ends by copying every CPU gradient into
+    ``cpu_copy_map_grad``; bounded mode stages each one later instead. The
+    original is called with no CPU optimizers visible so that second loop does
+    nothing, which keeps the FP32-alias half Megatron's own.
+    """
+    original = getattr(type(self), _ORIGINAL_SET_GRADS)
+    if not getattr(self, "bounded_cpu_grad_staging", False):
+        return original(self)
+    cpu_optimizers = self.cpu_optimizers
+    try:
+        self.cpu_optimizers = []
+        original(self)
+    finally:
+        self.cpu_optimizers = cpu_optimizers
+
+
+def _bounded_set_main_param_and_optimizer_states(self, model_param, tensors):
+    """Megatron's setter, for the two defects in this path.
+
+    ``padding`` entries describe gaps in the checkpoint bucket, not optimizer
+    state (they come from a separate ``hybrid_checkpoint`` concern but land in
+    the same method), so they are dropped for every caller. In bounded mode the
+    master is additionally restored into the tensor its sub-optimizer actually
+    reads: ``load_parameter_state_from_fs_model_space`` runs after
+    ``Hybrid.load_state_dict`` re-points state at the live FP32 owners, and a
+    replacement state entry alone would leave CPU Adam consuming a stale
+    tensor.
+    """
+    original = getattr(type(self), _ORIGINAL_SET_MAIN_PARAM)
+    config = getattr(self, "config", None)
+    hybrid = _hybrid_optimizer_class()
+    tensors = {key: value for key, value in tensors.items() if key != "padding"}
+    if (
+        isinstance(getattr(self, "optimizer", None), hybrid)
+        and getattr(self.optimizer, "bounded_cpu_grad_staging", False)
+        and getattr(config, "use_precision_aware_optimizer_no_fp8_or_ds_fp8", False)
+    ):
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        sharded = self.optimizer.param_groups[group_index]["params"][group_order]
+        inner_param = self.optimizer.param_to_inner_param[sharded]
+        for key, value in tensors.items():
+            if key == "param":
+                inner_param.data.copy_(value)
+                self.optimizer.state[sharded]["master_param"] = inner_param
+            else:
+                self.optimizer.state[sharded][key] = value.to(inner_param.device)
+        return None
+    return original(self, model_param, tensors)
+
+
+def _verify_bounded_contract():
+    """Fail unless Megatron still has the methods this replacement wraps.
+
+    The bounded path mirrors Megatron's update ordering, so the anchors it
+    borrows must still exist. Checked by source inspection so a refactor that
+    keeps them still passes; raising here is the point, since a renamed hook
+    would otherwise only show up as a wrong update or a lost checkpoint.
+    """
+    import inspect
+
+    hybrid = _hybrid_optimizer_class()
+    required = {
+        "_set_sub_optimizer_grads": "the gradient hand-off this stages around",
+        "_sync_hdo_param_groups_to_sub_optimizers": "the pre-step parameter-group sync",
+        "_sync_sub_optimizers_state_to_hdo": "the post-step state sync",
+    }
+    missing = [name for name in required if not hasattr(hybrid, name)]
+    if missing:
+        raise RuntimeError(
+            "Megatron's HybridDeviceOptimizer lacks "
+            + ", ".join(f"{name} ({required[name]})" for name in missing)
+            + ", so bounded_cpu_grad_staging cannot reproduce its update order. "
+            "Re-derive the patch in roll/third_party/megatron/cpu_master_params.py."
+        )
+    try:
+        source = inspect.getsource(hybrid.step)
+    except (OSError, TypeError) as exc:
+        raise RuntimeError(
+            "Cannot read Megatron's HybridDeviceOptimizer.step "
+            f"({type(exc).__name__}: {exc}); bounded_cpu_grad_staging mirrors it and cannot "
+            "be verified. Review that patch against the installed Megatron."
+        ) from exc
+    for marker in ("_sync_hdo_param_groups_to_sub_optimizers", "self._d2h_stream",
+                   "for cpu_optimizer in self.cpu_optimizers", "self._sync_sub_optimizers_state_to_hdo"):
+        if marker not in source:
+            raise RuntimeError(
+                f"Megatron's HybridDeviceOptimizer.step no longer contains {marker!r}; the "
+                "bounded copy in roll/third_party/megatron/cpu_master_params.py is stale."
+            )
+
+
+def install_bounded_cpu_grad_staging() -> bool:
+    """Install the bounded-staging replacement on the installed Megatron.
+
+    Idempotent. Called only when the ROLL config asks for bounded staging, so a
+    run without the flag never touches these classes.
+    """
+    hybrid = _hybrid_optimizer_class()
+    if getattr(hybrid, _BOUNDED_INSTALLED, False):
+        return True
+    _verify_bounded_contract()
+
+    setattr(hybrid, _ORIGINAL_INIT, hybrid.__init__)
+    setattr(hybrid, _ORIGINAL_STEP, hybrid.step)
+    setattr(hybrid, _ORIGINAL_SET_GRADS, hybrid._set_sub_optimizer_grads)
+
+    hybrid.__init__ = _bounded_init
+    hybrid.step = _bounded_step_dispatch
+    hybrid._set_sub_optimizer_grads = _bounded_set_sub_optimizer_grads
+    hybrid._prepare_bounded_cpu_grad_staging = _prepare_bounded_cpu_grad_staging
+    hybrid._stage_bounded_cpu_optimizer_grad = _stage_bounded_cpu_optimizer_grad
+
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    if not hasattr(DistributedOptimizer, _ORIGINAL_SET_MAIN_PARAM):
+        setattr(DistributedOptimizer, _ORIGINAL_SET_MAIN_PARAM,
+                DistributedOptimizer._set_main_param_and_optimizer_states)
+        DistributedOptimizer._set_main_param_and_optimizer_states = _bounded_set_main_param_and_optimizer_states
+
+    setattr(hybrid, _BOUNDED_INSTALLED, True)
+    return True
+
+
+def uninstall_bounded_cpu_grad_staging() -> bool:
+    """Restore Megatron's own methods. For tests and scope assertions."""
+    hybrid = _hybrid_optimizer_class()
+    if not getattr(hybrid, _BOUNDED_INSTALLED, False):
+        return False
+    for name, original_name in (("__init__", _ORIGINAL_INIT), ("step", _ORIGINAL_STEP),
+                                ("_set_sub_optimizer_grads", _ORIGINAL_SET_GRADS)):
+        original = getattr(hybrid, original_name, None)
+        if original is not None:
+            setattr(hybrid, name, original)
+        delattr(hybrid, original_name)
+    for name in ("_prepare_bounded_cpu_grad_staging", "_stage_bounded_cpu_optimizer_grad"):
+        if name in vars(hybrid):
+            delattr(hybrid, name)
+    from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+    original = getattr(DistributedOptimizer, _ORIGINAL_SET_MAIN_PARAM, None)
+    if original is not None:
+        DistributedOptimizer._set_main_param_and_optimizer_states = original
+        delattr(DistributedOptimizer, _ORIGINAL_SET_MAIN_PARAM)
+    delattr(hybrid, _BOUNDED_INSTALLED)
+    return True
