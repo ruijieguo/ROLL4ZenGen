@@ -121,7 +121,15 @@ class VirtualModels:
         VirtualModels boundary so callers do not need to know how many virtual
         stages are active.
         """
-        ngram_models = [model for model in self.models if callable(getattr(model, "attach_ngram_assets", None))]
+        # 必须先拆 DDP 包装：megatron_strategy 在训练前执行
+        # `self.model.models = self.models_wrapped`，而 Megatron 的
+        # DistributedDataParallel 既没有 __getattr__ 也没有自定义
+        # __getattribute__（实测 "DDP.__dict__" 里都没有），属性不转发。
+        # 直接在包装对象上 getattr(..., None) 恒为 None，于是这里走 else 分支、
+        # 返回空列表 —— 清单不写、不报错、不打日志。R02-a 的
+        # mca_external_assets.json 缺失就是这个原因（见 adaptation-review §22.15.2）。
+        unwrapped = [getattr(model, "module", model) for model in self.models]
+        ngram_models = [model for model in unwrapped if callable(getattr(model, "attach_ngram_assets", None))]
         if ngram_models:
             from .qwen4_exp.asset_lifecycle import persist_ngram_asset_models
 
@@ -129,12 +137,11 @@ class VirtualModels:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return []
         saved = []
-        for model in self.models:
+        for model in unwrapped:
             hook = getattr(model, "save_external_assets", None)
             if hook is not None:
                 saved.append(hook(save_directory))
         return saved
-
     def load_state_dict(self, state_dict: Dict[str, torch.Tensor], strict: bool = True):
         if len(self.models) == 1:
             if "model" in state_dict:

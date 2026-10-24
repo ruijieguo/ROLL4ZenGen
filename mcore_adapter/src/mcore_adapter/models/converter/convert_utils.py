@@ -181,14 +181,40 @@ def extract_suffix_number(s):
     return match.group() if match else None
 
 
-def gather_tensor_parallel(tensor: "torch.Tensor", async_op: bool = False):
-    group = mpu.get_tensor_model_parallel_group()
-    dst = dist.get_process_group_ranks(group)[0]
-    if mpu.get_tensor_model_parallel_rank() == 0:
-        gathered_tensors = [torch.empty_like(tensor) for _ in range(mpu.get_tensor_model_parallel_world_size())]
+def gather_tensor_parallel(tensor: "torch.Tensor", async_op: bool = False,
+                           is_expert_parallel: bool = False):
+    """收集张量并行分片到该组的 rank 0。
+
+    is_expert_parallel=True 时按专家张量并行组（ETP）收集，而不是 TP 组。
+    TP 与 ETP 不等时（moe_parallel_folding）专家权重根本没被 TP 切分，
+    用 TP 组会把同一份权重收多份、再被误当作多个 TP 分片。
+    ETP 组只有 1 个 rank 时不做集合通信，直接返回自身。
+    """
+    if is_expert_parallel:
+        # 组可能未创建（例如 ETP 与 TP 同值的老配置）；Megatron 自己的
+        # get_expert_tensor_parallel_world_size() 在这种情况回退到 TP 组，
+        # 这里沿用同一语义，避免 check_initialized 的断言。
+        group = mpu.get_expert_tensor_parallel_group(check_initialized=False)
+        if group is None:
+            group = mpu.get_tensor_model_parallel_group()
+            in_group_rank = mpu.get_tensor_model_parallel_rank()
+        else:
+            in_group_rank = mpu.get_expert_tensor_parallel_rank()
     else:
-        gathered_tensors = None
-    handle = dist.gather(tensor, gathered_tensors, dst=dst, group=group, async_op=async_op)
+        group = mpu.get_tensor_model_parallel_group()
+        in_group_rank = mpu.get_tensor_model_parallel_rank()
+
+    # 收集必须所有成员都参与，否则集合通信死锁。
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        gathered_tensors, handle = [tensor], None
+    else:
+        dst = dist.get_process_group_ranks(group)[0]
+        if in_group_rank == 0:
+            gathered_tensors = [torch.empty_like(tensor) for _ in range(world_size)]
+        else:
+            gathered_tensors = None
+        handle = dist.gather(tensor, gathered_tensors, dst=dst, group=group, async_op=async_op)
 
     if async_op:
         return gathered_tensors, handle
