@@ -277,8 +277,11 @@ class ModelConverter:
         return hf_state_dict
 
     def _needs_moe_allgather(self, mca_name: str, ep_world_size: int) -> bool:
+        # qwen4_exp 也必须在这里：它的模板要攒够 num_moe_experts 个专家才产出
+        # experts.gate_up_proj，而 edp_rank==0 的写盘者只握有 1/EP 的专家。
+        # 不跨 EP all_gather 就永远攒不满，产物会静默缺掉全部专家键。
         return (
-            self.mca_config.hf_model_type in ["qwen3_vl_moe", "qwen3_5_moe"]
+            self.mca_config.hf_model_type in ["qwen3_vl_moe", "qwen3_5_moe", "qwen4_exp"]
             and ep_world_size > 1
             and self.dist_converter.is_expert_parallel_weight(mca_name)
         )

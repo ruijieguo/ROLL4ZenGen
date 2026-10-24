@@ -1864,6 +1864,27 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             clear_memory(clear_host_memory=True)
 
         ckpt_format = self.megatron_train_args.ckpt_format
+        # HF-only checkpoint: when the HF export already ran and optimizer state is
+        # not requested, skip the mcore torch_dist path entirely. That path
+        # exchanges SavePlans over the world process group and has never completed
+        # with 40 ranks across nodes (it hangs in the world-group plan gather).
+        # The HF export walks TP/EP groups only, so it cannot hit that deadlock.
+        if self.megatron_train_args.save_hf_model and self.megatron_train_args.save_only_model:
+            if dist.get_rank() == 0:
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(save_dir)
+                if self.processor is not None:
+                    self.processor.save_pretrained(save_dir)
+            clear_memory(clear_host_memory=True)
+            if dist.is_initialized():
+                dist.barrier()
+            if self.worker_config.checkpoint_config.get("async_upload", True) and not is_last_step:
+                self.thread_executor.submit(self.checkpoint_manager.upload, ckpt_id=ckpt_id, local_state_path=local_state_path)
+            else:
+                self.checkpoint_manager.upload(ckpt_id=ckpt_id, local_state_path=local_state_path)
+            clear_memory(clear_host_memory=True)
+            return {"load": load_timer.last}
+
         # save model and tokenizer
         if len(self.models_unwrapped) == 1:
             if is_peft_available() and isinstance(self.models_unwrapped[0], PeftModel):
