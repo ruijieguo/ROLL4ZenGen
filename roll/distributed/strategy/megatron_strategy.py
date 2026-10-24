@@ -1867,7 +1867,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         # HF-only checkpoint: when the HF export already ran and optimizer state is
         # not requested, skip the mcore torch_dist path entirely. That path
         # exchanges SavePlans over the world process group and has never completed
-        # on this cluster (it hangs; see rsi/runs/R02/adaptation-review.md §22).
+        # with 40 ranks across nodes (it hangs in the world-group plan gather).
         # The HF export walks TP/EP groups only, so it cannot hit that deadlock.
         if self.megatron_train_args.save_hf_model and self.megatron_train_args.save_only_model:
             if dist.get_rank() == 0:

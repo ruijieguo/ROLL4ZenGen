@@ -126,8 +126,8 @@ class VirtualModels:
         # DistributedDataParallel 既没有 __getattr__ 也没有自定义
         # __getattribute__（实测 "DDP.__dict__" 里都没有），属性不转发。
         # 直接在包装对象上 getattr(..., None) 恒为 None，于是这里走 else 分支、
-        # 返回空列表 —— 清单不写、不报错、不打日志。R02-a 的
-        # mca_external_assets.json 缺失就是这个原因（见 adaptation-review §22.15.2）。
+        # 返回空列表 —— 清单不写、不报错、不打日志，
+        # 产物里静默缺失 mca_external_assets.json。
         unwrapped = [getattr(model, "module", model) for model in self.models]
         ngram_models = [model for model in unwrapped if callable(getattr(model, "attach_ngram_assets", None))]
         if ngram_models:
