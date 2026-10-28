@@ -212,7 +212,9 @@ def _sharded_param_state_dp_reshardable(self, model_sharded_state_dict, is_loadi
                             "padding": True,
                         }
 
-                for index_to_insert in reversed(sorted(list(all_pad_tensors.keys()))):
+                # Insert from end so that insertion positions are still correct.
+                indices_to_insert = sorted(list(all_pad_tensors.keys()))
+                for index_to_insert in reversed(indices_to_insert):
                     bucket_state.insert(index_to_insert, all_pad_tensors[index_to_insert])
 
                 for bucket_params_idx in range(len(bucket_state)):
@@ -282,6 +284,7 @@ def _param_and_grad_buffer_init(
     from megatron.core.distributed.param_and_grad_buffer import (
         BufferType,
         modify_underlying_storage,
+        nccl_allocator,
     )
     from megatron.core.fp8_utils import is_float8tensor, is_mxfp8tensor
     from megatron.core.utils import log_on_each_pipeline_stage
@@ -388,8 +391,6 @@ def _param_and_grad_buffer_init(
     self.grad_data = None
 
     if self.nccl_ub:
-        from megatron.core.distributed.param_and_grad_buffer import nccl_allocator
-
         nccl_allocator.init()
         pool = nccl_allocator.create_nccl_mem_pool(
             symmetric=not self.ddp_config.disable_symmetric_registration
@@ -498,7 +499,9 @@ def _param_and_grad_buffer_init(
     log_strs = []
     log_strs.append(f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}")
     for index, bucket in enumerate(self.buckets):
-        numel = sum(param.data.nelement() for param in bucket.params)
+        numel = 0
+        for param in bucket.params:
+            numel += param.data.nelement()
         log_strs.append(
             f"Params for bucket {index + 1} ({numel} elements, "
             f"{bucket.grad_data.nelement()} padded size):"
