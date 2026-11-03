@@ -100,10 +100,10 @@ def verify_upstream_route() -> str:
             "skipped. Re-derive it against the installed Megatron."
         )
 
-    # This class only extends Megatron's forward, so the routing checked above
-    # must be the routing that actually runs. A base that adds its own forward
-    # would make the inspection meaningless and could skip the overrides.
-    if "forward" in GatedDeltaNet.__dict__:
+    # The inspection above reads Megatron's forward, which is only the code that
+    # actually runs while the effective base IS Megatron's class. A different
+    # base that brings its own forward would make the inspection misleading.
+    if GatedDeltaNet is not _megatron_gdn and "forward" in GatedDeltaNet.__dict__:
         raise RuntimeError(
             f"{GatedDeltaNet.__module__}.{GatedDeltaNet.__qualname__} defines its own "
             "forward, so the verified routing is not the one Qwen4ExpGatedDeltaNet runs. "
