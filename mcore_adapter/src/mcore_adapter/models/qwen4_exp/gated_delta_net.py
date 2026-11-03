@@ -6,7 +6,18 @@ from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from .device_guard import is_cuda_device
+
+# On Ascend the Megatron GDN needs MindSpeed's NPU operators, which are installed
+# by MindSpeed's own GatedDeltaNet.__init__ -- and that class inherits from
+# Megatron's, so inheriting the Megatron class instead would skip the install
+# without raising anything. Prefer MindSpeed whenever it is importable; only a
+# missing package may fall back, so a broken install cannot silently disable the
+# NPU kernels.
+try:
+    from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet as GatedDeltaNet
+except ModuleNotFoundError:
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet as GatedDeltaNet
 
 # Megatron's GatedDeltaNet.forward, in the two layouts this model supports. The
 # overrides below only act if forward still reaches these points; anything else
@@ -41,10 +52,10 @@ def verify_upstream_route() -> str:
     comparing version numbers, so a backport or a refactor that keeps the
     routing still passes.
     """
-    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet as _megatron_gdn
 
     try:
-        source = inspect.getsource(GatedDeltaNet.forward)
+        source = inspect.getsource(_megatron_gdn.forward)
     except (OSError, TypeError) as exc:
         raise RuntimeError(
             "Cannot read the source of Megatron's GatedDeltaNet.forward "
@@ -53,7 +64,7 @@ def verify_upstream_route() -> str:
             "Megatron."
         ) from exc
 
-    if hasattr(GatedDeltaNet, "_compute_g_and_beta"):
+    if hasattr(_megatron_gdn, "_compute_g_and_beta"):
         if HOOK_LAYOUT_CALL not in source:
             raise RuntimeError(
                 "Megatron defines GatedDeltaNet._compute_g_and_beta but its forward never "
@@ -87,6 +98,16 @@ def verify_upstream_route() -> str:
             "Megatron's GatedDeltaNet.forward does not reach a causal convolution this "
             "model can intercept, so the native-rounding override would be silently "
             "skipped. Re-derive it against the installed Megatron."
+        )
+
+    # This class only extends Megatron's forward, so the routing checked above
+    # must be the routing that actually runs. A base that adds its own forward
+    # would make the inspection meaningless and could skip the overrides.
+    if "forward" in GatedDeltaNet.__dict__:
+        raise RuntimeError(
+            f"{GatedDeltaNet.__module__}.{GatedDeltaNet.__qualname__} defines its own "
+            "forward, so the verified routing is not the one Qwen4ExpGatedDeltaNet runs. "
+            "Re-derive these overrides against that implementation."
         )
     return layout
 
@@ -368,7 +389,7 @@ class Qwen4ExpGatedDeltaNet(GatedDeltaNet):
         if self.out_norm.zero_centered_gamma:
             weight = weight + 1
         activation = self.config.gdn_output_gate_type
-        if x.is_cuda:
+        if is_cuda_device(x):
             if activation == "sigmoid":
                 from .gated_norm import sigmoid_gated_rms_norm
 
