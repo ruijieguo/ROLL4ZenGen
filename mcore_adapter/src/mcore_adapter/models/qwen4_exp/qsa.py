@@ -108,6 +108,61 @@ def _compiled_flex_attention():
     return torch.compile(flex_attention, dynamic=False)
 
 
+def eager_qsa_attention(query, key, value, selection, key_chunk=256):
+    """Selected attention for devices without flex_attention.
+
+    Same selection contract as flex_qsa_attention -- the query sees its selected
+    complete microblocks plus the causal remainder of its own block -- but the
+    scores are streamed in key chunks with an online softmax instead of being
+    handed to a tiled kernel. Nothing here is fused, so it is the reference that
+    a device-specific kernel can be checked against, not a throughput path.
+    """
+    batch, heads, seq, dim = query.shape
+    groups = heads // key.shape[1]
+    scale = dim ** -0.5
+    allowed = selection.mask_mod()
+
+    b_idx = torch.arange(batch, device=query.device)[:, None, None]
+    q_idx = torch.arange(seq, device=query.device)[None, :, None]
+
+    running_max = torch.full((batch, heads, seq), -torch.inf, dtype=torch.float32, device=query.device)
+    running_sum = torch.zeros((batch, heads, seq), dtype=torch.float32, device=query.device)
+    acc = torch.zeros((batch, heads, seq, dim), dtype=torch.float32, device=query.device)
+    query_fp32 = query.float()
+
+    for start in range(0, seq, key_chunk):
+        stop = min(start + key_chunk, seq)
+        k_idx = torch.arange(start, stop, device=query.device)[None, None, :]
+        mask = allowed(b_idx, None, q_idx, k_idx)[:, None]
+        mask = mask.expand(batch, heads, seq, stop - start)
+        key_fp32 = key[:, :, start:stop].float().repeat_interleave(groups, dim=1)
+        value_chunk = value[:, :, start:stop].float().repeat_interleave(groups, dim=1)
+
+        logits = torch.matmul(query_fp32, key_fp32.transpose(-1, -2)) * scale
+        logits = logits.masked_fill(~mask, -torch.inf)
+        chunk_max = logits.amax(dim=-1)
+        new_max = torch.maximum(running_max, chunk_max)
+
+        # A fully masked chunk keeps new_max at -inf; exp(-inf - -inf) is nan, so
+        # both the rescale and the exponentials are clamped to zero there.
+        rescale = torch.exp(running_max - new_max)
+        rescale = torch.where(torch.isfinite(rescale), rescale, torch.zeros_like(rescale))
+        probs = torch.exp(logits - new_max.unsqueeze(-1))
+        probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+
+        running_sum = running_sum * rescale + probs.sum(dim=-1)
+        acc = acc * rescale.unsqueeze(-1) + torch.matmul(probs.to(value.dtype).float(), value_chunk)
+        running_max = new_max
+
+    has_keys = running_sum > 0
+    safe_sum = torch.where(has_keys, running_sum, torch.ones_like(running_sum))
+    output = (acc / safe_sum.unsqueeze(-1)).to(query.dtype)
+    output = torch.where(has_keys.unsqueeze(-1), output, torch.zeros_like(output))
+    lse = torch.where(has_keys, running_max + running_sum.log(),
+                      torch.full_like(running_sum, -torch.inf))
+    return output, lse
+
+
 def flex_qsa_attention(query, key, value, selection):
     """Exact selected attention with PyTorch's autograd-capable tiled kernel.
 
@@ -117,13 +172,13 @@ def flex_qsa_attention(query, key, value, selection):
     fine-grained selection; throughput must be measured against other kernels.
     """
     from torch.nn.attention.flex_attention import AuxRequest, BlockMask
-    if query.device.type != "cuda":
-        raise ValueError("QSA FlexAttention training requires a CUDA device")
     batch, heads, seq, dim = query.shape
     if key.shape != value.shape or key.shape[0] != batch or key.shape[2:] != (seq, dim):
         raise ValueError("QSA core requires matching self-attention Q/K/V sequence and head dimensions")
     if heads % key.shape[1] or selection.valid.shape != (batch, seq):
         raise ValueError("invalid QSA GQA head ratio or selection shape")
+    if query.device.type != "cuda":
+        return eager_qsa_attention(query, key, value, selection)
     tile_size = 128
     tiles = (seq + tile_size - 1) // tile_size
     counts = torch.arange(1, tiles+1, dtype=torch.int32, device=query.device).view(1, 1, tiles).expand(batch, 1, tiles).contiguous()
