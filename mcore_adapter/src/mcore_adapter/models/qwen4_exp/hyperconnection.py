@@ -31,6 +31,7 @@ CPU execution retains a plain PyTorch implementation.
 from __future__ import annotations
 
 import torch
+from .device_guard import is_cuda_device
 from torch import nn
 from torch.nn import functional as F
 
@@ -54,7 +55,7 @@ def grouped_gemma_rmsnorm(
 
     if weight.numel() not in (d, total):
         raise ValueError(f"hc_norm weight has {weight.numel()} elements; expected {d} or {total}")
-    if x.is_cuda:
+    if is_cuda_device(x):
         from .hyperconnection_kernels import GroupedNorm
 
         return GroupedNorm.apply(x, weight, eps, hc_count, after_combine)
@@ -93,7 +94,7 @@ def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Ten
     """
     *lead, total = x.shape
     d = total // hc_count
-    if x.is_cuda:
+    if is_cuda_device(x):
         from .hyperconnection_kernels import GateMix
 
         return GateMix.apply(x, gate, hc_count)
@@ -116,7 +117,7 @@ def hc_combine(
     """
     *lead, total = residual.shape
     d = total // hc_count
-    if residual.is_cuda:
+    if is_cuda_device(residual):
         from .hyperconnection_kernels import Combine
 
         return Combine.apply(residual, block_output, injection_logits, hc_count)
@@ -141,7 +142,7 @@ class _GRProjection(nn.Linear):
         self.output_offset = offset
 
     def forward(self, x):
-        if not x.is_cuda:
+        if not is_cuda_device(x):
             return super().forward(x)
         start = self.output_offset
         end = start + self.out_features
@@ -231,7 +232,7 @@ class HyperConnection(nn.Module):
             for layer in (down, inject)
             for name in ('_forward_pre_hooks', '_forward_hooks', '_backward_pre_hooks', '_backward_hooks')
         )
-        if xn.is_cuda and bare_pair and not has_hooks:
+        if is_cuda_device(xn) and bare_pair and not has_hooks:
             # Native down + injection + alignment padding share one GEMM.
             # Only fuse bare modules: wrappers must execute their own forward
             # for active/disabled/merged adapters and their backward semantics.

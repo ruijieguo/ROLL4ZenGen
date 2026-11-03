@@ -2,6 +2,7 @@
 from functools import lru_cache
 
 import torch
+from .device_guard import is_cuda_device
 from torch.nn import functional as F
 
 
@@ -44,5 +45,5 @@ def causal_conv1d(x: torch.Tensor, weight: torch.Tensor, bias=None) -> torch.Ten
         raise ValueError("Expected x [batch, time, dim] and weight [dim, width]")
     if weight.shape[-1] < 1 or (bias is not None and bias.shape != (x.shape[-1],)):
         raise ValueError("Invalid causal convolution width or bias shape")
-    function = _compiled_convolution() if x.is_cuda else _convolution
+    function = _compiled_convolution() if is_cuda_device(x) else _convolution
     return function(x, weight, bias)

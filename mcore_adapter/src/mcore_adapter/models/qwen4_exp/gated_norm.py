@@ -8,6 +8,7 @@ FLA's fused backward, without changing other models' FLA normalization.
 from __future__ import annotations
 
 import torch
+from .device_guard import is_cuda_device
 import triton
 import triton.language as tl
 
@@ -62,7 +63,7 @@ def sigmoid_gated_rms_norm(x, gate, weight, eps):
     """Normalize contiguous head rows, retaining FP32 through sigmoid gating."""
     if x.ndim != 2 or gate.shape != x.shape or weight.shape != (x.shape[-1],):
         raise ValueError("Expected [rows, head_dim] inputs and one head_dim weight")
-    if not x.is_cuda or not gate.is_cuda or not weight.is_cuda:
+    if not is_cuda_device(x) or not is_cuda_device(gate) or not is_cuda_device(weight):
         raise ValueError("Qwen3.8 fused gated RMSNorm requires CUDA tensors")
     if x.shape[0] == 0:
         return (x * gate * weight).to(x.dtype)

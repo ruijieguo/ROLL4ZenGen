@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import torch
+from .device_guard import is_cuda_device
 from torch.autograd.function import once_differentiable
 from torch.nn import functional as F
 
@@ -41,7 +42,7 @@ def linear_with_fp32_output(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
     CPU and full-precision inputs use the ordinary differentiable linear path.
     """
     if x.dtype in (torch.bfloat16, torch.float16):
-        if x.is_cuda:
+        if is_cuda_device(x):
             return _LinearWithFP32Output.apply(x, weight)
         return F.linear(x.float(), weight.float())
     return F.linear(x, weight)
