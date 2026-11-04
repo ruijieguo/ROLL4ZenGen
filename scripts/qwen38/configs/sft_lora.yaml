@@ -13,9 +13,9 @@ track_with: stdout
 num_gpus_per_node: 8
 # Include model save and storage upload in the worker RPC budget.
 rpc_timeout: 14400
-max_steps: 100
-save_steps: 50
-eval_steps: 50
+max_steps: ${oc.decode:${oc.env:ROLL_MAX_STEPS,100}}
+save_steps: ${oc.decode:${oc.env:ROLL_SAVE_STEPS,50}}
+eval_steps: ${oc.decode:${oc.env:ROLL_EVAL_STEPS,50}}
 logging_steps: 1
 resume_from_checkpoint: false
 sequence_length: ${oc.decode:${oc.env:ROLL_SEQUENCE_LENGTH,8192}}
