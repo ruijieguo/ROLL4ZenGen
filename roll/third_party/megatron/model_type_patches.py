@@ -19,6 +19,13 @@ the change sits in the middle of the body and cannot be expressed as a call
 around it. Each copy carries a contract check against the installed source --
 see :func:`_verify_contracts` -- so a Megatron refactor fails loudly rather than
 silently reverting to the unpatched behaviour.
+
+``ddp_memory`` is the exception: its body walks ``__init__``'s parameters
+(`param.data`, the bucket layout), so a parameter renamed or added upstream makes
+the copy call Megatron with the wrong values rather than fail. It therefore also
+compares its own signature with the installed ``__init__`` and, when they differ,
+leaves Megatron's implementation alone and logs what drifted. Only peak memory
+depends on it, so declining it is safe; the other three are correctness fixes.
 """
 
 import inspect
@@ -520,6 +527,33 @@ def _param_and_grad_buffer_init(
 # ---------------------------------------------------------------------------
 # installation
 # ---------------------------------------------------------------------------
+def _ddp_memory_drift(installed_init) -> str:
+    """How the installed ``__init__`` signature differs from the reproduced one.
+
+    Empty string when the reproduction still matches, i.e. when installing it
+    would call Megatron with the values this body assumes. Any difference means
+    the body would mis-read its arguments (Megatron 0.18.2, for instance, passes
+    ``params_with_names`` pairs and an extra ``param_layout``).
+    """
+    reproduced = list(inspect.signature(_param_and_grad_buffer_init).parameters)
+    installed = list(inspect.signature(installed_init).parameters)
+    if reproduced == installed:
+        return ""
+
+    drift = [
+        f"{mine!r} became {theirs!r}"
+        for mine, theirs in zip(reproduced, installed)
+        if mine != theirs
+    ]
+    extra = list(installed[len(reproduced) :])
+    missing = list(reproduced[len(installed) :])
+    if extra:
+        drift.append("added " + ", ".join(repr(name) for name in extra))
+    if missing:
+        drift.append("dropped " + ", ".join(repr(name) for name in missing))
+    return "; ".join(drift)
+
+
 def _verify_contracts():
     """Fail unless the installed Megatron still has the anchors these need.
 
@@ -609,8 +643,18 @@ def install_for_model_type(model_type: Optional[str]) -> bool:
     )
     DistributedOptimizer.sharded_param_state_dp_reshardable = _sharded_param_state_dp_reshardable
 
-    setattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL, _ParamAndGradBuffer.__init__)
-    _ParamAndGradBuffer.__init__ = _param_and_grad_buffer_init
+    drift = _ddp_memory_drift(_ParamAndGradBuffer.__init__)
+    if drift:
+        logger.warning(
+            "Not installing the Qwen4 ddp_memory patch: the installed Megatron's "
+            "_ParamAndGradBuffer.__init__ no longer matches the signature this "
+            "reproduction was derived from (%s), so it would mis-read its arguments. "
+            "Megatron's own implementation stays in place; only peak memory is affected.",
+            drift,
+        )
+    else:
+        setattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL, _ParamAndGradBuffer.__init__)
+        _ParamAndGradBuffer.__init__ = _param_and_grad_buffer_init
 
     setattr(clip_grads, _INSTALLED_FLAG, True)
     logger.info("Installed the Qwen4 model-type Megatron patches for model_type=%s", model_type)
@@ -640,8 +684,9 @@ def uninstall() -> bool:
     )
     delattr(DistributedOptimizer, _CHECKPOINT_PADDING_ORIGINAL)
 
-    _ParamAndGradBuffer.__init__ = getattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL)
-    delattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL)
+    if hasattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL):
+        _ParamAndGradBuffer.__init__ = getattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL)
+        delattr(_ParamAndGradBuffer, _DDP_MEMORY_ORIGINAL)
 
     delattr(clip_grads, _INSTALLED_FLAG)
     return True

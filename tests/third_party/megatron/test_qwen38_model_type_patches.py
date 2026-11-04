@@ -4,7 +4,10 @@ These replace functions on the installed Megatron instead of asking each user to
 patch their own checkout, so the install must be exact: nothing touched for
 another model type, nothing left unreplaced for a Flash-Next one, and put back
 byte-for-byte on uninstall. Two of the four reproduce upstream bodies, so a
-renamed anchor has to fail the install rather than silently diverge.
+renamed anchor has to fail the install rather than silently diverge -- except
+``ddp_memory``, whose body reads ``__init__``'s parameters and therefore stands
+down (leaving Megatron's own version in place) when the installed signature moves
+away from the one it reproduces.
 
 Runs against the installed megatron-core (skipped when absent). The attribute
 assertions create no CUDA context.
@@ -77,22 +80,76 @@ def test_other_model_types_are_untouched(clean, model_type):
 
 
 @pytest.mark.parametrize("model_type", sorted(FLASH_NEXT_MODEL_TYPES))
-def test_every_flash_next_type_installs_all_four(clean, model_type):
+def test_every_flash_next_type_installs_the_correctness_patches(clean, model_type):
+    """The three correctness patches are unconditional; ddp_memory only fits some versions."""
     before = (
         clip_grads.clip_grad_by_total_norm_fp32,
         DistributedOptimizer.sharded_param_state_dp_reshardable,
-        _ParamAndGradBuffer.__init__,
         MoEAlltoAllTokenDispatcher.combine_postprocess,
     )
+    buffer_init = _ParamAndGradBuffer.__init__
+    buffer_patch_fits = model_type_patches._ddp_memory_drift(buffer_init) == ""
+
     assert model_type_patches.install_for_model_type(model_type) is True
     after = (
         clip_grads.clip_grad_by_total_norm_fp32,
         DistributedOptimizer.sharded_param_state_dp_reshardable,
-        _ParamAndGradBuffer.__init__,
         MoEAlltoAllTokenDispatcher.combine_postprocess,
     )
     for original, replacement in zip(before, after):
         assert replacement is not original
+
+    if buffer_patch_fits:
+        assert _ParamAndGradBuffer.__init__ is model_type_patches._param_and_grad_buffer_init
+    else:
+        assert _ParamAndGradBuffer.__init__ is buffer_init
+
+
+def test_the_buffer_patch_fits_the_signature_it_reproduces():
+    """The drift check must not fire on the signature the body was written for."""
+
+    def same(
+        self,
+        ddp_config,
+        param_dtype,
+        grad_dtype,
+        params,
+        data_parallel_group,
+        bucket_size,
+        param_to_name,
+        gradient_scaling_factor,
+        param_indices,
+        nccl_ub,
+        pg_collection=None,
+    ):
+        return None
+
+    assert model_type_patches._ddp_memory_drift(same) == ""
+
+
+def test_the_buffer_patch_stands_down_when_megatron_adds_parameters():
+    """megatron-core 0.18.2 passes param pairs plus param_layout; the copy must not install."""
+
+    def newer(
+        self,
+        ddp_config,
+        param_dtype,
+        grad_dtype,
+        params_with_names,
+        data_parallel_group,
+        bucket_size,
+        param_to_name,
+        gradient_scaling_factor,
+        param_indices,
+        nccl_ub,
+        pg_collection=None,
+        param_layout=None,
+    ):
+        return None
+
+    drift = model_type_patches._ddp_memory_drift(newer)
+    assert "params_with_names" in drift
+    assert "param_layout" in drift
 
 
 def test_install_is_idempotent(clean):
