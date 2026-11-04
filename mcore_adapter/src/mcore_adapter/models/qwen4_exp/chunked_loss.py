@@ -171,8 +171,15 @@ def _chunked_vocab_projection(hidden, weight, labels, chunk_size, tp_group,
         raise ValueError("hidden and vocabulary weight must have matching hidden dimensions")
     if hidden.dtype != weight.dtype or hidden.device != weight.device:
         raise ValueError("hidden and vocabulary weight must share dtype and device")
-    if labels.dtype != torch.long or labels.device != hidden.device:
-        raise ValueError("labels must be int64 on the hidden-state device")
+    if labels.dtype not in (torch.int32, torch.int64) or labels.device != hidden.device:
+        raise ValueError(
+            "labels must be an int32 or int64 tensor on the hidden-state device: got labels "
+            f"{labels.dtype} on {labels.device}, hidden {hidden.dtype} on {hidden.device}"
+        )
+    # ROLL's DataProto narrows every int64 batch tensor to int32 on NPU, and a
+    # vocabulary index never needs the wider type, so accept both and index in
+    # one type. Cast is label-sized, not vocab-sized.
+    labels = labels.to(torch.int64)
     world_size = dist.get_world_size(tp_group) if tp_group is not None else 1
     expected_shape = list(hidden.shape[:-1])
     if sequence_parallel:

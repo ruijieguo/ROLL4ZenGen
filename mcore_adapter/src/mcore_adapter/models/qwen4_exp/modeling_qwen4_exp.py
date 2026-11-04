@@ -219,11 +219,18 @@ class Qwen4ExpModel(McaGPTModel):
             token_labels[~loss_mask[:, 1:].bool()] = 0
             token_labels = torch.cat((token_labels, torch.zeros_like(token_labels[:, :1])), dim=1)
         elif (
-            token_labels.dtype != torch.long
+            token_labels.dtype not in (torch.int32, torch.int64)
             or token_labels.device != input_ids.device
             or token_labels.shape != input_ids.shape
         ):
-            raise ValueError("bounded RL token labels must be int64 [batch, sequence] on the input device")
+            raise ValueError(
+                "bounded RL token labels must be int32 or int64 [batch, sequence] on the "
+                f"input device: got {token_labels.dtype} on {token_labels.device} "
+                f"shape {tuple(token_labels.shape)}"
+            )
+        # ROLL's DataProto narrows int64 batch tensors to int32 on NPU, including the
+        # input_ids the fallback labels are built from; index in one type.
+        token_labels = token_labels.to(torch.int64)
         output_weight = self.shared_embedding_or_output_weight() if self.share_embeddings_and_output_weights else None
         head_weight = output_weight if output_weight is not None else self.output_layer.weight
         statistics = chunked_vocab_parallel_logprobs_and_entropy(

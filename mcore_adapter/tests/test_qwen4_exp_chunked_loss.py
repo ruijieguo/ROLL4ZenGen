@@ -190,3 +190,26 @@ def test_chunking_bounds_saved_logits_and_peak_memory(distributed):
     print(json.dumps(dict(test="peak_memory", rank=dist.get_rank(), bytes=peaks)), flush=True)
     assert peaks["chunked"] < peaks["stock"] * 0.35, peaks
     parallel_state.destroy_model_parallel()
+
+
+def test_int32_labels_match_int64_labels():
+    """NPU batches arrive with int32 labels, so both integer widths must agree.
+
+    ROLL's DataProto narrows every int64 batch tensor to int32 on NPU
+    (roll/distributed/scheduler/protocol.py). The projection indexes with the
+    labels, so it takes either width and indexes in one.
+    """
+    chunked = implementation()
+    torch.manual_seed(11)
+    hidden = torch.randn(9, 64)
+    weight = torch.randn(256, 64) * 0.1
+    labels = torch.arange(9) * 7 % 256
+    labels[::4] = -100
+
+    wide = chunked(hidden, weight, labels, chunk_size=4)
+    narrow = chunked(hidden, weight, labels.to(torch.int32), chunk_size=4)
+    torch.testing.assert_close(narrow, wide)
+
+    with pytest.raises(ValueError, match="int32 or int64"):
+        chunked(hidden, weight, labels.float(), chunk_size=4)
+
