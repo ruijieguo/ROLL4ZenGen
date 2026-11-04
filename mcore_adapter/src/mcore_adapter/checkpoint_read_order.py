@@ -36,7 +36,18 @@ def patch_mcore_checkpoint_read_order():
     original = getattr(strategy, '_get_filesystem_reader', None)
     if original is None or getattr(original, '_mcore_storage_ordered', False):
         return
-    supported = (strategy.FileSystemReader, strategy.CachedMetadataFileSystemReader)
+    # megatron-core 0.18.0 ships CachedMetadataFileSystemReader, 0.18.2 dropped it.
+    # Patch whichever of the two readers this version still has.
+    supported = tuple(
+        reader_type
+        for reader_type in (
+            getattr(strategy, "FileSystemReader", None),
+            getattr(strategy, "CachedMetadataFileSystemReader", None),
+        )
+        if reader_type is not None
+    )
+    if not supported:
+        return
 
     @wraps(original)
     def get_reader(*args, **kwargs):
