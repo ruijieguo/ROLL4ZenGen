@@ -67,6 +67,15 @@ class Qwen4ExpConfig(McaModelConfig):
     # HF reference's score scaling (see qsa.default_indexer_temperature). An
     # explicit override is honored as-is; do not silently substitute 1.0.
     qsa_indexer_temperature: Optional[float] = None
+    # Query rows per tile in indexer_distillation_loss. Tiling only bounds
+    # transient memory (rows are independent), so the loss does not depend on
+    # it. Each tile is one Python iteration and one TP all_reduce. Measured on
+    # B300 with the Flash-Next per-rank shapes at TP4 (6 heads, 2 KV heads,
+    # head_dim 256, budget 2048), forward+backward per layer call at seq 12288:
+    #   tile 16: 1.51 s  64: 0.40 s  128: 0.25 s  256: 0.19 s  512: 0.17 s
+    # Extra peak memory is ~10 MiB per row (2.6 GiB at 256), independent of
+    # sequence length. 256 is the knee; lower it only if memory is tight.
+    qsa_indexer_tile_size: int = 256
 
     # --- hyperconnection (replaces the ordinary residual stream) -------------
     # 398 checkpoint tensors; residual width is hidden_size * hc_count.
@@ -115,6 +124,8 @@ class Qwen4ExpConfig(McaModelConfig):
             raise ValueError("Qwen4Exp text training currently requires BF16/FP32 without MTP")
         if self.cpu_offloading or self.fine_grained_activation_offloading:
             raise ValueError("Qwen4Exp activation offloading is not yet validated")
+        if self.qsa_indexer_tile_size < 1:
+            raise ValueError("QSA indexer tile size must be positive")
         if self.qsa_indexer_kl_coef < 0:
             raise ValueError("QSA indexer KL coefficient must be nonnegative")
         if self.qsa_indexer_temperature is None:

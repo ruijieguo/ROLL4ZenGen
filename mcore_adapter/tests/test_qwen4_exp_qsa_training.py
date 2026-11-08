@@ -133,3 +133,66 @@ def test_flex_sparse_core_forward_backward_and_lse():
     (expected*cotangent).sum().backward()
     for got, want in ((q, qr), (k, kr), (v, vr)):
         torch.testing.assert_close(got.grad, want.grad, atol=1e-5, rtol=1e-4)
+
+
+def _gather_student_reference(iq, ik, selection, query, key, lse, temperature, loss_mask):
+    """Previous implementation: gather selected keys, then score (slow backward)."""
+    batch, seq = selection.valid.shape
+    sel = selection.selected_blocks
+    mask = sel.ge(0)
+    batch_ids = torch.arange(batch)[:, None, None]
+    gathered = ik[batch_ids, sel.clamp_min(0)]
+    scores = torch.matmul(iq.float(), gathered.float().transpose(-1, -2)).relu().sum(-2) / temperature
+    return scores.masked_fill(~mask, torch.finfo(torch.float32).min)
+
+
+@pytest.mark.parametrize("nvalid,left", [(13, False), (5, False), (40, True), (64, False)])
+def test_indexer_distillation_padding_and_tile_invariance(nvalid, left):
+    # Heavy padding leaves most selected slots at -1; the loss and gradients
+    # must match across tile sizes, including one larger than the sequence.
+    torch.manual_seed(nvalid)
+    b, s, h, kv, d, ih, idim = 2, 64, 4, 2, 8, 2, 4
+    valid = torch.zeros(b, s, dtype=torch.bool)
+    if left:
+        valid[:, s - nvalid:] = True
+    else:
+        valid[:, :nvalid] = True
+    valid[1, :3] = False
+    iq0, ik0 = torch.randn(b, s, ih, idim), torch.randn(b, s // 4, idim)
+    selection = qsa.QSASelection.from_scores(torch.rand(b, s, s // 4), valid, 4, 16)
+    if nvalid < s // 2:
+        assert (selection.selected_blocks < 0).float().mean() > 0.3
+    query, key = torch.randn(b, h, s, d), torch.randn(b, kv, s, d)
+    lse = torch.randn(b, h, s).abs() + 3
+    results = []
+    for tile in (1, 3, 16, 128):
+        iq, ik = iq0.clone().requires_grad_(), ik0.clone().requires_grad_()
+        loss = qsa.indexer_distillation_loss(iq, ik, selection, query, key, lse, temperature=2.0,
+                                             tile_size=tile, loss_mask=valid)
+        loss.backward()
+        results.append((loss.detach(), iq.grad, ik.grad))
+    for loss, giq, gik in results[1:]:
+        torch.testing.assert_close(loss, results[0][0], rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(giq, results[0][1], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(gik, results[0][2], rtol=1e-5, atol=1e-6)
+
+
+def test_indexer_student_scores_match_gather_formulation():
+    torch.manual_seed(7)
+    b, s, ih, idim = 2, 32, 2, 4
+    valid = torch.zeros(b, s, dtype=torch.bool)
+    valid[:, :11] = True
+    selection = qsa.QSASelection.from_scores(torch.rand(b, s, s // 4), valid, 4, 16)
+    iq, ik = torch.randn(b, s, ih, idim), torch.randn(b, s // 4, idim)
+    ref = _gather_student_reference(iq, ik, selection, None, None, None, 2.0, None)
+    sel = selection.selected_blocks
+    dense = torch.matmul(iq.reshape(b, s * ih, idim), ik.transpose(-1, -2)).reshape(b, s, ih, -1).relu().sum(-2)
+    actual = (dense.gather(-1, sel.clamp_min(0)) / 2.0).masked_fill(~sel.ge(0), torch.finfo(torch.float32).min)
+    torch.testing.assert_close(actual, ref, rtol=1e-6, atol=1e-6)
+
+
+def test_config_rejects_nonpositive_qsa_tile_size():
+    import re
+    src = (ROOT / "config_qwen4_exp.py").read_text()
+    assert re.search(r"qsa_indexer_tile_size: int = \d+", src)
+    assert "QSA indexer tile size must be positive" in src
