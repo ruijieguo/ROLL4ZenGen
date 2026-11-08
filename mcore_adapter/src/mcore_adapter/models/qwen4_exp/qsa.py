@@ -286,9 +286,18 @@ def indexer_distillation_loss(index_query, index_key, selection, query, key, lse
     total = index_query.new_zeros((), dtype=torch.float32)
 
     def student_tile(iq, ik, selected, teacher, row_mask):
+        # Score every compressed block with one dense matmul, then gather the
+        # selected columns. Gathering the keys first (ik[selected]) makes the
+        # backward an index_put_(accumulate=True) whose duplicate indices are
+        # summed serially by a single warp. Unselected slots (-1) all clamp to
+        # block 0, so every query with fewer visible blocks than the budget --
+        # the first budget tokens of each sequence, and every padding row --
+        # piles onto one index. With right padding this kernel took ~7 s per
+        # layer call on B300 and ~94% of the training step.
         mask = selected.ge(0)
-        gathered = ik[batch_ids, selected.clamp_min(0)]
-        scores = torch.matmul(iq.float(), gathered.float().transpose(-1, -2)).relu().sum(-2) / temperature
+        b_, t_, h_, d_ = iq.shape
+        dense = torch.matmul(iq.float().reshape(b_, t_ * h_, d_), ik.float().transpose(-1, -2))
+        scores = dense.reshape(b_, t_, h_, -1).relu().sum(-2).gather(-1, selected.clamp_min(0)) / temperature
         safe = scores.masked_fill(~mask, torch.finfo(torch.float32).min)
         log_q = safe.log_softmax(-1)
         per_row = (teacher * (teacher.clamp_min(1e-12).log() - log_q)).sum(-1)

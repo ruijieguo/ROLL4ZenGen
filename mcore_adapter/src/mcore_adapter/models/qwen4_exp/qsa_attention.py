@@ -82,6 +82,7 @@ class Qwen4ExpQSAAttention(SelfAttention):
         if self.training and self.config.qsa_indexer_kl_coef > 0:
             aux = indexer_distillation_loss(index_q, index_k, selection, q, k, lse,
                                            temperature=self.config.qsa_indexer_temperature,
+                                           tile_size=self.config.qsa_indexer_tile_size,
                                            loss_mask=qsa_loss_mask, tp_group=self.pg_collection.tp)
             # Each TP rank computes identical indexer loss from globally summed
             # teacher heads. SP reduction sums replicated parameter gradients.
